@@ -1,0 +1,39 @@
+{
+  "name": "fastmail-axi",
+  "version": "1.0.0",
+  "description": "Fastmail email, contacts, calendar via JMAP (42 tools)",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "FASTMAIL_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "inbox", "desc": "List recent emails in inbox", "args": ["--limit"]},
+    {"name": "search", "desc": "Search emails", "args": ["<query>", "--limit"]},
+    {"name": "get", "desc": "Get email detail", "args": ["<id>"]},
+    {"name": "send", "desc": "Send an email", "args": ["--to <addr>", "--subject <text>", "--body <text>"]},
+    {"name": "contacts", "desc": "List contacts", "args": ["--limit"]},
+    {"name": "contact", "desc": "Get contact detail", "args": ["<id>"]},
+    {"name": "calendar", "desc": "List calendar events", "args": ["--limit"]},
+    {"name": "event", "desc": "Get event detail", "args": ["<id>"]},
+    {"name": "create-event", "desc": "Create calendar event", "args": ["--summary <text>", "--start <iso>", "--end <iso>"]},
+    {"name": "delete-event", "desc": "Delete calendar event", "args": ["<id>"]},
+    {"name": "mailboxes", "desc": "List mailboxes/folders", "args": ["--limit"]},
+    {"name": "mailbox", "desc": "Get mailbox detail", "args": ["<id>"]},
+    {"name": "create-mailbox", "desc": "Create a new mailbox/folder", "args": ["--name <text>", "--parent <id>"]},
+    {"name": "draft", "desc": "Create a draft email", "args": ["--to <addr>", "--subject <text>"]},
+    {"name": "send-draft", "desc": "Send a draft email", "args": ["<id>"]},
+    {"name": "delete", "desc": "Delete an email", "args": ["<id>"]},
+    {"name": "move", "desc": "Move email to folder", "args": ["<id>", "--to <mailbox>"]},
+    {"name": "thread", "desc": "Get email thread", "args": ["<id>"]},
+    {"name": "reply", "desc": "Reply to an email", "args": ["<id>", "--body <text>"]},
+    {"name": "account", "desc": "Show account info", "args": []},
+    {"name": "identities", "desc": "List sending identities", "args": []},
+    {"name": "labels", "desc": "List labels/tags", "args": []},
+    {"name": "bulk", "desc": "Bulk email operations (mark read, archive, delete)", "args": ["--ids <ids>", "--action <action>"]},
+    {"name": "advanced-search", "desc": "Search with full JMAP filters", "args": ["--filter <json>", "--limit"]},
+    {"name": "call", "desc": "Call any JMAP method directly", "args": ["<method>", "<args>"]},
+    {"name": "status", "desc": "Health check", "args": []}
+  ],
+  "plugin": "plugin/axi-fastmail-axi.js"
+}

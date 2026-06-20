@@ -1,0 +1,953 @@
+#!/usr/bin/env node
+// fastmail-axi — CLI for fastmail-mcp server
+// Communicates via MCP JSON-RPC over HTTP.
+// Token-efficient TOON output. Agent-friendly.
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+// ── Configuration ───────────────────────────────────
+
+const FASTMAIL_URL = process.env.FASTMAIL_AXI_URL || 'http://localhost:8001';
+
+http.globalAgent.keepAlive = true;
+
+var BASE = new URL(FASTMAIL_URL);
+var PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
+var HOSTNAME = BASE.hostname;
+var PORT = parseInt(BASE.port, 10) || (PROTOCOL === 'https' ? 443 : 80);
+var PATH = BASE.pathname || '/';
+
+// ── MCP state ───────────────────────────────────────
+
+var _initialized = false;
+var _toolSchemas = null;   // { toolName: { inputSchema, description } }
+var _serverCapabilities = null;
+
+// ── Low-level MCP JSON-RPC call ─────────────────────
+
+function mcpSend(method, params, id) {
+  // Build JSON-RPC payload — notifications have no id field
+  var rpc = {
+    jsonrpc: '2.0',
+    method: method,
+    params: params || {}
+  };
+  if (id !== null) {
+    rpc.id = id || Date.now();
+  }
+  var payload = JSON.stringify(rpc);
+
+  return new Promise(function(resolve, reject) {
+    var transport = PROTOCOL === 'https' ? https : http;
+
+    var options = {
+      hostname: HOSTNAME,
+      port: PORT,
+      path: PATH,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    var req = transport.request(options, function(res) {
+      var body = '';
+      res.on('data', function(chunk) { body += chunk.toString(); });
+      res.on('end', function() {
+        if (res.statusCode >= 400) {
+          var preview = body.slice(0, 500);
+          reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
+          return;
+        }
+
+        // Parse SSE stream — find the JSON-RPC response in data: lines
+        var jsonData = null;
+        var lines = body.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.indexOf('data: ') === 0 || line.indexOf('data:') === 0) {
+            var jsonStr = line.slice(line.indexOf(':') + 1).trim();
+            if (jsonStr) {
+              try {
+                var candidate = JSON.parse(jsonStr);
+                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                  jsonData = candidate;
+                }
+              } catch (_) { /* skip non-JSON data lines */ }
+            }
+          }
+        }
+
+        // If no SSE data found, try parsing body as direct JSON-RPC
+        if (!jsonData) {
+          try {
+            var direct = JSON.parse(body);
+            if (direct && typeof direct === 'object') {
+              jsonData = direct;
+            }
+          } catch (_) { /* body is not pure JSON */ }
+        }
+
+        if (!jsonData) {
+          reject(new Error('No valid JSON-RPC response. Body preview: ' + body.slice(0, 300)));
+          return;
+        }
+
+        if (jsonData.error) {
+          reject(new Error(jsonData.error.message || JSON.stringify(jsonData.error)));
+          return;
+        }
+
+        resolve(jsonData.result);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, function() {
+      req.destroy();
+      reject(new Error('request timeout after 30s'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// ── MCP handshake and tool call ─────────────────────
+
+async function ensureInitialized() {
+  if (_initialized) return;
+
+  // Step 1: initialize
+  var initResult = await mcpSend('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'fastmail-axi', version: '1.0.0' }
+  }, 1);
+
+  _serverCapabilities = initResult;
+
+  // Step 2: send initialized notification (no id, fire-and-forget)
+  try {
+    // Notification — no id, no response expected
+    mcpSend('notifications/initialized', {}, null);
+  } catch (_) { /* ignore */ }
+
+  // Step 3: discover tools
+  var toolsResult = await mcpSend('tools/list', {}, 2);
+
+  _toolSchemas = {};
+  if (toolsResult && Array.isArray(toolsResult.tools)) {
+    for (var i = 0; i < toolsResult.tools.length; i++) {
+      var t = toolsResult.tools[i];
+      _toolSchemas[t.name] = {
+        description: t.description || '',
+        inputSchema: t.inputSchema || {}
+      };
+    }
+  }
+
+  _initialized = true;
+}
+
+async function mcpCallTool(toolName, params) {
+  await ensureInitialized();
+  params = params || {};
+
+  var result = await mcpSend('tools/call', {
+    name: toolName,
+    arguments: params
+  }, Date.now());
+
+  // Unwrap MCP tools/call result
+  // Spec: result.content[] → find text content → JSON.parse
+  if (result && Array.isArray(result.content)) {
+    var textItem = null;
+    for (var j = 0; j < result.content.length; j++) {
+      if (result.content[j].type === 'text') {
+        textItem = result.content[j];
+        break;
+      }
+    }
+    if (textItem && typeof textItem.text === 'string') {
+      try {
+        result = JSON.parse(textItem.text);
+      } catch (_) {
+        result = textItem.text;
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') {
+        return JSON.stringify(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function ok(dataObj) {
+  console.log(toon({ ok: true, data: dataObj }));
+}
+
+// ── Helpers ─────────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+function consumeFlag(args, flag) {
+  var idx = args.indexOf(flag);
+  if (idx === -1) return null;
+  if (idx + 1 < args.length && !args[idx + 1].startsWith('-')) {
+    var val = args[idx + 1];
+    args.splice(idx, 2);
+    return val;
+  }
+  args.splice(idx, 1);
+  return 'true';
+}
+
+function requireArg(args, idx, name) {
+  if (idx >= args.length || args[idx].startsWith('-')) {
+    die('missing ' + name);
+  }
+  return args[idx];
+}
+
+function confirmPrompt(msg) {
+  var readline = require('readline');
+  var rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+
+  return new Promise(function(resolve) {
+    rl.question(msg + ' [y/N] ', function(answer) {
+      rl.close();
+      resolve((answer || '').toLowerCase() === 'y' || (answer || '').toLowerCase() === 'yes');
+    });
+  });
+}
+
+// ── Email output formatters ─────────────────────────
+
+function formatEmailSummary(e) {
+  var parts = [
+    e.id || '?',
+    (e.from || (e.sender || {}).email || e.fromAddr || '?'),
+    (e.subject || '(no subject)'),
+    (e.date || e.receivedAt || e.sentAt || '?')
+  ];
+  return parts.join(',');
+}
+
+function formatEmailDetail(e) {
+  var out = {};
+  if (e.id) out.id = e.id;
+  if (e.subject) out.subject = e.subject;
+  if (e.from) out.from = e.from;
+  else if (e.sender) out.from = (e.sender.name || '') + ' <' + e.sender.email + '>';
+  if (e.to) out.to = e.to;
+  if (e.cc) out.cc = e.cc;
+  if (e.date) out.date = e.date;
+  else if (e.receivedAt) out.date = e.receivedAt;
+  if (e.threadId || e.thread_id) out.thread = e.threadId || e.thread_id;
+  if (e.mailboxIds) out.mailboxes = Array.isArray(e.mailboxIds) ? e.mailboxIds.join(', ') : String(e.mailboxIds);
+  if (e.hasAttachment) out.attachments = true;
+  if (e.preview) out.preview = e.preview;
+  if (e.body) {
+    out.body = e.body.length > 500 ? e.body.slice(0, 497) + '...' : e.body;
+  }
+  return out;
+}
+
+function formatContactSummary(c) {
+  return [
+    c.id || '?',
+    (c.name || '(no name)'),
+    (c.email || '?')
+  ].join(',');
+}
+
+function formatEventSummary(ev) {
+  return [
+    ev.id || '?',
+    (ev.title || '(no title)'),
+    (ev.start || ev.startDate || '?'),
+    (ev.end || ev.endDate || '')
+  ].join(',');
+}
+
+// ── Commands ────────────────────────────────────────
+
+async function cmdInbox(args) {
+  var params = {};
+  var limit = flagVal(args, '--limit');
+  if (limit) params.limit = parseInt(limit, 10) || 10;
+
+  var result = await mcpCallTool('get_recent_emails', params);
+  var emails = result.emails || result.messages || result || [];
+  if (!Array.isArray(emails)) emails = [emails];
+
+  // TOP section: summary table
+  console.log('ok: true');
+  console.log('inbox[' + emails.length + ']{id,from,subject,date}:');
+
+  for (var i = 0; i < emails.length; i++) {
+    console.log('  ' + formatEmailSummary(emails[i]));
+  }
+
+  // HELP section
+  if (emails.length > 0) {
+    console.log('help[' + Math.min(emails.length, 3) + ']:');
+    for (var j = 0; j < Math.min(emails.length, 3); j++) {
+      console.log('  fastmail-axi get ' + (emails[j].id || '?'));
+    }
+    if (emails.length > 0) {
+      console.log('  fastmail-axi search "<query>"');
+    }
+  }
+}
+
+async function cmdSearch(args) {
+  var query = args[1];
+  if (!query) die('missing search query');
+  var params = { query: query };
+  var limit = flagVal(args, '--limit');
+  if (limit) params.limit = parseInt(limit, 10) || 10;
+
+  var result = await mcpCallTool('search_emails', params);
+  var emails = result.emails || result.messages || result || [];
+  if (!Array.isArray(emails)) emails = [emails];
+
+  console.log('ok: true');
+  console.log('search[' + emails.length + ']{id,from,subject,date}:');
+  for (var i = 0; i < emails.length; i++) {
+    console.log('  ' + formatEmailSummary(emails[i]));
+  }
+  if (emails.length > 0) {
+    console.log('help[' + Math.min(emails.length, 3) + ']:');
+    for (var j = 0; j < Math.min(emails.length, 3); j++) {
+      console.log('  fastmail-axi get ' + (emails[j].id || '?'));
+    }
+  }
+}
+
+async function cmdGet(args) {
+  var emailId = args[1];
+  if (!emailId) die('missing email ID');
+
+  var result = await mcpCallTool('get_email', { email_id: emailId });
+  var email = result.email || result;
+
+  console.log('ok: true');
+  console.log(toon({ email: formatEmailDetail(email) }));
+
+  if (email && email.id) {
+    console.log('\nhelp[4]:');
+    console.log('  fastmail-axi reply ' + email.id + ' "<body>"');
+    console.log('  fastmail-axi thread ' + (email.threadId || email.thread_id || '?'));
+    console.log('  fastmail-axi move ' + email.id + ' <mailbox>');
+    console.log('  fastmail-axi delete ' + email.id);
+  }
+}
+
+async function cmdSend(args) {
+  var to = args[1];
+  var subject = args[2];
+  var body = args[3];
+  if (!to) die('missing recipient (to)');
+  if (!subject) die('missing subject');
+  if (!body) die('missing body');
+
+  var params = { to: to, subject: subject, body: body };
+  var cc = flagVal(args, '--cc');
+  var bcc = flagVal(args, '--bcc');
+  var inReplyTo = flagVal(args, '--in-reply-to');
+  if (cc) params.cc = cc;
+  if (bcc) params.bcc = bcc;
+  if (inReplyTo) params.in_reply_to = inReplyTo;
+
+  var result = await mcpCallTool('send_email', params);
+  ok(result);
+}
+
+async function cmdContacts(args) {
+  var query = args[1];
+  if (!query) die('missing contact query');
+  var params = { query: query };
+
+  var result = await mcpCallTool('search_contacts', params);
+  var contacts = result.contacts || result || [];
+  if (!Array.isArray(contacts)) contacts = [contacts];
+
+  console.log('ok: true');
+  console.log('contacts[' + contacts.length + ']{id,name,email}:');
+  for (var i = 0; i < contacts.length; i++) {
+    console.log('  ' + formatContactSummary(contacts[i]));
+  }
+}
+
+async function cmdContact(args) {
+  var contactId = args[1];
+  if (!contactId) die('missing contact ID');
+
+  var result = await mcpCallTool('get_contact', { contact_id: contactId });
+  var contact = result.contact || result;
+  ok(contact);
+}
+
+async function cmdCalendar(args) {
+  var params = {};
+  var from = flagVal(args, '--from');
+  var to = flagVal(args, '--to');
+  if (from) params.from = from;
+  if (to) params.to = to;
+
+  var result = await mcpCallTool('list_calendar_events', params);
+  var events = result.events || result || [];
+  if (!Array.isArray(events)) events = [events];
+
+  console.log('ok: true');
+  console.log('calendar[' + events.length + ']{id,title,start,end}:');
+  for (var i = 0; i < events.length; i++) {
+    console.log('  ' + formatEventSummary(events[i]));
+  }
+}
+
+async function cmdEvent(args) {
+  var eventId = args[1];
+  if (!eventId) die('missing event ID');
+
+  var result = await mcpCallTool('get_calendar_event', { event_id: eventId });
+  var event = result.event || result;
+  ok(event);
+}
+
+async function cmdCreateEvent(args) {
+  var title = args[1];
+  var start = args[2];
+  if (!title) die('missing event title');
+  if (!start) die('missing event start time');
+
+  var params = { title: title, start: start };
+  var end = flagVal(args, '--end');
+  var location = flagVal(args, '--location');
+  var description = flagVal(args, '--description');
+  if (end) params.end = end;
+  if (location) params.location = location;
+  if (description) params.description = description;
+
+  var result = await mcpCallTool('create_calendar_event', params);
+  ok(result);
+}
+
+async function cmdDeleteEvent(args) {
+  var eventId = args[1];
+  if (!eventId) die('missing event ID');
+
+  if (!hasFlag(args, '--yes')) {
+    var confirmed = await confirmPrompt('Delete event ' + eventId + '?');
+    if (!confirmed) die('cancelled');
+  }
+
+  var result = await mcpCallTool('delete_calendar_event', { event_id: eventId });
+  ok(result || { deleted: eventId });
+}
+
+async function cmdMailboxes(args) {
+  var result = await mcpCallTool('list_mailboxes', {});
+  var mailboxes = result.mailboxes || result || [];
+  if (!Array.isArray(mailboxes)) mailboxes = [mailboxes];
+
+  console.log('ok: true');
+  console.log('mailboxes[' + mailboxes.length + ']{name,role,total}:');
+  for (var i = 0; i < mailboxes.length; i++) {
+    var m = mailboxes[i];
+    console.log('  ' + [
+      m.name || m.id || '?',
+      m.role || '-',
+      (m.totalEmails || m.total || m.count || '?')
+    ].join(','));
+  }
+}
+
+async function cmdMailbox(args) {
+  var name = args[1];
+  if (!name) die('missing mailbox name');
+
+  var result = await mcpCallTool('get_mailbox_stats', { name: name });
+  ok(result);
+}
+
+async function cmdCreateMailbox(args) {
+  var name = args[1];
+  if (!name) die('missing mailbox name');
+
+  var params = { name: name };
+  var parent = flagVal(args, '--parent');
+  if (parent) params.parent = parent;
+
+  var result = await mcpCallTool('create_mailbox', params);
+  ok(result);
+}
+
+async function cmdDraft(args) {
+  var to = args[1];
+  var subject = args[2];
+  var body = args[3];
+  if (!to) die('missing recipient (to)');
+  if (!subject) die('missing subject');
+  if (!body) die('missing body');
+
+  var params = { to: to, subject: subject, body: body };
+  var cc = flagVal(args, '--cc');
+  if (cc) params.cc = cc;
+
+  var result = await mcpCallTool('create_draft', params);
+  ok(result);
+}
+
+async function cmdSendDraft(args) {
+  var draftId = args[1];
+  if (!draftId) die('missing draft ID');
+
+  var result = await mcpCallTool('send_draft', { draft_id: draftId });
+  ok(result);
+}
+
+async function cmdDelete(args) {
+  var emailId = args[1];
+  if (!emailId) die('missing email ID');
+
+  if (!hasFlag(args, '--yes')) {
+    var confirmed = await confirmPrompt('Delete email ' + emailId + '?');
+    if (!confirmed) die('cancelled');
+  }
+
+  var result = await mcpCallTool('delete_email', { email_id: emailId });
+  ok(result || { deleted: emailId });
+}
+
+async function cmdMove(args) {
+  var emailId = args[1];
+  var mailbox = args[2];
+  if (!emailId) die('missing email ID');
+  if (!mailbox) die('missing target mailbox');
+
+  var result = await mcpCallTool('move_email', { email_id: emailId, mailbox: mailbox });
+  ok(result);
+}
+
+async function cmdThread(args) {
+  var threadId = args[1];
+  if (!threadId) die('missing thread ID');
+
+  var result = await mcpCallTool('get_thread', { thread_id: threadId });
+  var messages = result.messages || result.emails || result || [];
+  if (!Array.isArray(messages)) messages = [messages];
+
+  console.log('ok: true');
+  console.log('thread[' + messages.length + ']{id,from,subject,date}:');
+  for (var i = 0; i < messages.length; i++) {
+    console.log('  ' + formatEmailSummary(messages[i]));
+  }
+}
+
+async function cmdReply(args) {
+  var emailId = args[1];
+  var body = args[2];
+  if (!emailId) die('missing email ID');
+  if (!body) die('missing reply body');
+
+  var params = { email_id: emailId, body: body };
+  var replyAll = hasFlag(args, '--all');
+  if (replyAll) params.reply_all = true;
+
+  var result = await mcpCallTool('reply_email', params);
+  ok(result);
+}
+
+async function cmdAccount(args) {
+  try {
+    var result = await mcpCallTool('get_account_summary', {});
+    ok(result);
+  } catch (e) {
+    ok({ status: 'error', error: e.message, url: FASTMAIL_URL });
+    process.exit(1);
+  }
+}
+
+async function cmdIdentities(args) {
+  var result = await mcpCallTool('list_identities', {});
+  var identities = result.identities || result || [];
+  if (!Array.isArray(identities)) identities = [identities];
+
+  console.log('ok: true');
+  console.log('identities[' + identities.length + ']{id,name,email}:');
+  for (var i = 0; i < identities.length; i++) {
+    var idn = identities[i];
+    console.log('  ' + [
+      idn.id || '?',
+      idn.name || '(no name)',
+      idn.email || '?'
+    ].join(','));
+  }
+}
+
+async function cmdLabels(args) {
+  var subcmd = args[1];
+  var emailId = args[2];
+
+  if (subcmd === 'list') {
+    if (!emailId) die('missing email ID');
+    var result = await mcpCallTool('list_labels', { email_id: emailId });
+    ok(result);
+  } else if (subcmd === 'add') {
+    if (!emailId) die('missing email ID');
+    var labels = args.slice(3);
+    if (labels.length === 0) die('missing labels');
+    var result = await mcpCallTool('add_labels', { email_id: emailId, labels: labels });
+    ok(result);
+  } else if (subcmd === 'remove') {
+    if (!emailId) die('missing email ID');
+    var labels2 = args.slice(3);
+    if (labels2.length === 0) die('missing labels');
+    var result2 = await mcpCallTool('remove_labels', { email_id: emailId, labels: labels2 });
+    ok(result2);
+  } else {
+    die('unknown labels subcommand: ' + subcmd + ' (use add, remove, or list)');
+  }
+}
+
+async function cmdBulk(args) {
+  var subcmd = args[1];
+  var mailbox = args[2];
+  if (!subcmd) die('missing bulk subcommand (delete, read, move, pin)');
+  if (!mailbox) die('missing mailbox');
+
+  var params = { mailbox: mailbox };
+  var ids = consumeFlag(args, '--ids');
+  var query = consumeFlag(args, '--query');
+  if (ids) params.ids = ids.split(',').map(function(s) { return s.trim(); });
+  if (query) params.query = query;
+
+  if (subcmd === 'delete') {
+    if (!hasFlag(args, '--yes')) {
+      var confirmed = await confirmPrompt('Bulk delete emails in mailbox ' + mailbox + '?');
+      if (!confirmed) die('cancelled');
+    }
+    var result = await mcpCallTool('bulk_delete', params);
+    ok(result);
+  } else if (subcmd === 'read') {
+    var result2 = await mcpCallTool('bulk_mark_read', params);
+    ok(result2);
+  } else if (subcmd === 'move') {
+    var target = args[3];
+    if (!target) die('missing target mailbox for move');
+    params.target = target;
+    var result3 = await mcpCallTool('bulk_move', params);
+    ok(result3);
+  } else if (subcmd === 'pin') {
+    var result4 = await mcpCallTool('bulk_pin', params);
+    ok(result4);
+  } else {
+    die('unknown bulk subcommand: ' + subcmd + ' (use delete, read, move, or pin)');
+  }
+}
+
+async function cmdAdvancedSearch(args) {
+  var query = args[1];
+  if (!query) die('missing JMAP query (JSON string)');
+
+  var queryObj;
+  try {
+    queryObj = JSON.parse(query);
+  } catch (e) {
+    die('invalid JSON query: ' + e.message);
+  }
+
+  var result = await mcpCallTool('advanced_search', { query: queryObj });
+  var emails = result.emails || result.messages || result || [];
+  if (!Array.isArray(emails)) emails = [emails];
+
+  console.log('ok: true');
+  console.log('advanced-search[' + emails.length + ']{id,from,subject,date}:');
+  for (var i = 0; i < emails.length; i++) {
+    console.log('  ' + formatEmailSummary(emails[i]));
+  }
+}
+
+async function cmdCall(args) {
+  var toolName = args[1];
+  if (!toolName) die('missing tool name');
+
+  var params = {};
+
+  // Check for --json flag
+  var jsonArg = flagVal(args, '--json');
+  if (jsonArg) {
+    try {
+      params = JSON.parse(jsonArg);
+    } catch (e) {
+      die('invalid JSON args: ' + e.message);
+    }
+  } else {
+    // Parse remaining args as --key value pairs
+    for (var i = 2; i < args.length; i++) {
+      if (args[i].startsWith('--')) {
+        var key = args[i].slice(2);
+        if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+          params[key] = args[i + 1];
+          i++;
+        } else {
+          params[key] = true;
+        }
+      }
+    }
+  }
+
+  var result = await mcpCallTool(toolName, params);
+  ok(result);
+}
+
+async function cmdStatus(args) {
+  try {
+    await ensureInitialized();
+    var toolCount = _toolSchemas ? Object.keys(_toolSchemas).length : 0;
+    ok({
+      status: 'ok',
+      tools: toolCount,
+      url: FASTMAIL_URL,
+      protocolVersion: (_serverCapabilities && _serverCapabilities.protocolVersion) || '2024-11-05'
+    });
+  } catch (e) {
+    ok({ status: 'error', error: e.message, url: FASTMAIL_URL });
+    process.exit(1);
+  }
+}
+
+function cmdHelp() {
+  console.log('fastmail-axi <command> [options]');
+  console.log('');
+  console.log('Email commands:');
+  console.log('  inbox [--limit N]                        Get recent emails');
+  console.log('  search <query> [--limit N]                Search emails');
+  console.log('  get <email-id>                            Get full email details');
+  console.log('  send <to> <subject> <body> [--cc addr] [--bcc addr]  Send email');
+  console.log('  reply <email-id> <body> [--all]           Reply to email');
+  console.log('  delete <email-id> [--yes]                 Delete email (--yes skips confirm)');
+  console.log('  move <email-id> <mailbox>                 Move email to mailbox');
+  console.log('  thread <thread-id>                        Get thread messages');
+  console.log('  draft <to> <subject> <body> [--cc addr]   Create draft');
+  console.log('  send-draft <draft-id>                     Send a draft');
+  console.log('');
+  console.log('Contact commands:');
+  console.log('  contacts <query>                          Search contacts');
+  console.log('  contact <contact-id>                      Get contact details');
+  console.log('');
+  console.log('Calendar commands:');
+  console.log('  calendar [--from date] [--to date]        List calendar events');
+  console.log('  event <event-id>                          Get event details');
+  console.log('  create-event <title> <start> [--end date] [--location loc]  Create event');
+  console.log('  delete-event <event-id> [--yes]           Delete event');
+  console.log('');
+  console.log('Mailbox commands:');
+  console.log('  mailboxes                                 List all mailboxes');
+  console.log('  mailbox <name>                            Get mailbox stats');
+  console.log('  create-mailbox <name> [--parent name]     Create a new mailbox');
+  console.log('');
+  console.log('Label commands:');
+  console.log('  labels list <email-id>                    List labels on an email');
+  console.log('  labels add <email-id> <label...>          Add labels to an email');
+  console.log('  labels remove <email-id> <label...>       Remove labels from an email');
+  console.log('');
+  console.log('Bulk commands:');
+  console.log('  bulk delete <mailbox> [--ids a,b,c] [--query q] [--yes]');
+  console.log('  bulk read <mailbox> [--ids a,b,c] [--query q]');
+  console.log('  bulk move <mailbox> <target> [--ids a,b,c] [--query q]');
+  console.log('  bulk pin <mailbox> [--ids a,b,c] [--query q]');
+  console.log('');
+  console.log('Other:');
+  console.log('  advanced-search <jmap-query-json>         Advanced JMAP query');
+  console.log('  account                                   Account summary');
+  console.log('  identities                                List email identities');
+  console.log('  status                                    Server health check');
+  console.log('  call <tool-name> --json \'{"k":"v"}\'        Call any MCP tool directly');
+  console.log('  call <tool-name> --key val --key2 val2     Call with key=value args');
+  console.log('');
+  console.log('Env: FASTMAIL_AXI_URL (default: http://localhost:8001)');
+}
+
+// ── CLI routing ─────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+if (!cmd || cmd === '--help' || cmd === '-h') {
+  cmdHelp();
+  process.exit(0);
+}
+
+if (cmd === 'help') {
+  if (args[1]) {
+    // Show help for specific command
+    console.log('help for: ' + args[1]);
+    console.log('  Run fastmail-axi --help for full usage.');
+    process.exit(0);
+  }
+  cmdHelp();
+  process.exit(0);
+}
+
+(async function main() {
+  try {
+    switch (cmd) {
+      case 'inbox':
+        await cmdInbox(args);
+        break;
+      case 'search':
+        await cmdSearch(args);
+        break;
+      case 'get':
+        await cmdGet(args);
+        break;
+      case 'send':
+        await cmdSend(args);
+        break;
+      case 'contacts':
+        await cmdContacts(args);
+        break;
+      case 'contact':
+        await cmdContact(args);
+        break;
+      case 'calendar':
+        await cmdCalendar(args);
+        break;
+      case 'event':
+        await cmdEvent(args);
+        break;
+      case 'create-event':
+        await cmdCreateEvent(args);
+        break;
+      case 'delete-event':
+        await cmdDeleteEvent(args);
+        break;
+      case 'mailboxes':
+        await cmdMailboxes(args);
+        break;
+      case 'mailbox':
+        await cmdMailbox(args);
+        break;
+      case 'create-mailbox':
+        await cmdCreateMailbox(args);
+        break;
+      case 'draft':
+        await cmdDraft(args);
+        break;
+      case 'send-draft':
+        await cmdSendDraft(args);
+        break;
+      case 'delete':
+        await cmdDelete(args);
+        break;
+      case 'move':
+        await cmdMove(args);
+        break;
+      case 'thread':
+        await cmdThread(args);
+        break;
+      case 'reply':
+        await cmdReply(args);
+        break;
+      case 'account':
+        await cmdAccount(args);
+        break;
+      case 'identities':
+        await cmdIdentities(args);
+        break;
+      case 'labels':
+        await cmdLabels(args);
+        break;
+      case 'bulk':
+        await cmdBulk(args);
+        break;
+      case 'advanced-search':
+        await cmdAdvancedSearch(args);
+        break;
+      case 'status':
+        await cmdStatus(args);
+        break;
+      case 'call':
+        await cmdCall(args);
+        break;
+      default:
+        die('unknown command: ' + cmd + ' (use --help to see all commands)');
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();

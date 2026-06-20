@@ -9,7 +9,13 @@
       "env": {
         "CLUSTER_OPS_AXI_URL": "URL of the cluster-ops API endpoint"
       },
-      "commands": ["status", "containers", "disk", "services", "journal"],
+      "commands": [
+        "status",
+        "containers",
+        "disk",
+        "services",
+        "journal"
+      ],
       "has_plugin": false,
       "has_skill": true
     },
@@ -22,7 +28,15 @@
       "env": {
         "LORE_MCP_URL": "URL of the lore MCP knowledge server (default: http://192.168.1.21:5555/mcp)"
       },
-      "commands": ["kb-search", "kb-get", "kb-list", "jrnl-today", "jrnl-search", "inv-list", "search-local"],
+      "commands": [
+        "kb-search",
+        "kb-get",
+        "kb-list",
+        "jrnl-today",
+        "jrnl-search",
+        "inv-list",
+        "search-local"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -37,7 +51,14 @@
         "LANGFUSE_AXI_PK": "Langfuse public key",
         "LANGFUSE_AXI_SK": "Langfuse secret key"
       },
-      "commands": ["traces", "trace", "prompts", "prompt", "status", "sessions"],
+      "commands": [
+        "traces",
+        "trace",
+        "prompts",
+        "prompt",
+        "status",
+        "sessions"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -51,7 +72,16 @@
         "KANBAN_AXI_URL": "Kanban API base URL",
         "KANBAN_AXI_TOKEN": "Kanban API authentication token"
       },
-      "commands": ["board", "tasks", "task", "create", "update", "delete", "boards", "status"],
+      "commands": [
+        "board",
+        "tasks",
+        "task",
+        "create",
+        "update",
+        "delete",
+        "boards",
+        "status"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -64,7 +94,14 @@
       "env": {
         "VECTOR_INDEXER_AXI_URL": "URL of the vector-indexer API endpoint"
       },
-      "commands": ["search", "semantic", "hybrid", "chunks", "status", "reindex"],
+      "commands": [
+        "search",
+        "semantic",
+        "hybrid",
+        "chunks",
+        "status",
+        "reindex"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -77,7 +114,15 @@
       "env": {
         "CODEINTEL_AXI_CMD": "Override server command (default: .venv/bin/python -m codeintel_router.server)"
       },
-      "commands": ["symbols", "callers", "callees", "search", "references", "index-repo", "index-status"],
+      "commands": [
+        "symbols",
+        "callers",
+        "callees",
+        "search",
+        "references",
+        "index-repo",
+        "index-status"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -88,7 +133,14 @@
       "runtime": "Node.js",
       "path": "tools/gh-axi",
       "env": {},
-      "commands": ["issue", "pr", "run", "release", "repo", "label"],
+      "commands": [
+        "issue",
+        "pr",
+        "run",
+        "release",
+        "repo",
+        "label"
+      ],
       "has_plugin": true,
       "has_skill": false
     },
@@ -99,7 +151,89 @@
       "runtime": "Node.js",
       "path": "tools/npm-axi",
       "env": {},
-      "commands": ["search", "view", "versions", "downloads"],
+      "commands": [
+        "search",
+        "view",
+        "versions",
+        "downloads"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "fastmail-axi",
+      "version": "1.0.0",
+      "description": "Fastmail email, contacts, calendar via JMAP (42 tools)",
+      "runtime": "node >= 18",
+      "path": "tools/fastmail-axi",
+      "env": {
+        "FASTMAIL_AXI_URL": "URL of the Fastmail MCP server endpoint"
+      },
+      "commands": [
+        "inbox",
+        "search",
+        "get",
+        "send",
+        "contacts",
+        "contact",
+        "calendar",
+        "event",
+        "create-event",
+        "delete-event",
+        "mailboxes",
+        "mailbox",
+        "create-mailbox",
+        "draft",
+        "send-draft",
+        "delete",
+        "move",
+        "thread",
+        "reply",
+        "account",
+        "identities",
+        "labels",
+        "bulk",
+        "advanced-search",
+        "call",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "workspace-axi",
+      "version": "1.0.0",
+      "description": "Google Workspace — Gmail, Drive, Calendar, Docs, Contacts, Tasks (24 tools)",
+      "runtime": "node >= 18",
+      "path": "tools/workspace-axi",
+      "env": {
+        "WORKSPACE_AXI_URL": "URL of the Workspace MCP server endpoint"
+      },
+      "commands": [
+        "gmail list",
+        "gmail search",
+        "gmail get",
+        "gmail send",
+        "gmail draft",
+        "gmail labels",
+        "drive list",
+        "drive get",
+        "drive search",
+        "drive download",
+        "drive create",
+        "calendar list",
+        "calendar get",
+        "calendar create",
+        "calendar delete",
+        "docs get",
+        "docs create",
+        "contacts search",
+        "contacts get",
+        "tasks list",
+        "tasks create",
+        "call",
+        "status"
+      ],
       "has_plugin": true,
       "has_skill": false
     }

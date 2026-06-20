@@ -1,0 +1,36 @@
+{
+  "name": "workspace-axi",
+  "version": "1.0.0",
+  "description": "Google Workspace — Gmail, Drive, Calendar, Docs, Contacts, Tasks (24 tools)",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "WORKSPACE_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "gmail list", "desc": "List recent Gmail messages", "args": ["--limit"]},
+    {"name": "gmail search", "desc": "Search Gmail messages", "args": ["<query>", "--limit"]},
+    {"name": "gmail get", "desc": "Get Gmail message detail", "args": ["<id>"]},
+    {"name": "gmail send", "desc": "Send a Gmail message", "args": ["--to <addr>", "--subject <text>", "--body <text>"]},
+    {"name": "gmail draft", "desc": "Create Gmail draft", "args": ["--to <addr>", "--subject <text>"]},
+    {"name": "gmail labels", "desc": "List Gmail labels", "args": []},
+    {"name": "drive list", "desc": "List Drive files", "args": ["--limit"]},
+    {"name": "drive get", "desc": "Get Drive file detail", "args": ["<id>"]},
+    {"name": "drive search", "desc": "Search Drive files", "args": ["<query>", "--limit"]},
+    {"name": "drive download", "desc": "Download a Drive file", "args": ["<id>", "--output <path>"]},
+    {"name": "drive create", "desc": "Create a Drive file/folder", "args": ["--name <text>", "--folder"]},
+    {"name": "calendar list", "desc": "List calendar events", "args": ["--limit"]},
+    {"name": "calendar get", "desc": "Get calendar event detail", "args": ["<id>"]},
+    {"name": "calendar create", "desc": "Create a calendar event", "args": ["--summary <text>", "--start <iso>", "--end <iso>"]},
+    {"name": "calendar delete", "desc": "Delete a calendar event", "args": ["<id>"]},
+    {"name": "docs get", "desc": "Get Doc content", "args": ["<id>"]},
+    {"name": "docs create", "desc": "Create a Google Doc", "args": ["--title <text>", "--content <text>"]},
+    {"name": "contacts search", "desc": "Search contacts", "args": ["<query>", "--limit"]},
+    {"name": "contacts get", "desc": "Get contact detail", "args": ["<id>"]},
+    {"name": "tasks list", "desc": "List tasks", "args": ["--list <id>"]},
+    {"name": "tasks create", "desc": "Create a task", "args": ["--title <text>", "--list <id>"]},
+    {"name": "call", "desc": "Call any Workspace API tool directly", "args": ["<tool-name>", "<args>"]},
+    {"name": "status", "desc": "Health check", "args": []}
+  ],
+  "plugin": "plugin/axi-workspace-axi.js"
+}

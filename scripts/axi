@@ -343,6 +343,8 @@ TOOLS
   codeintel-axi       LSP-based code intelligence
   gh-axi              GitHub operations
   npm-axi             npm registry search
+  fastmail-axi         Fastmail email, contacts, calendar via JMAP
+  workspace-axi        Google Workspace — Gmail, Drive, Calendar, Docs, Contacts, Tasks
 
 INSTALL PATHS
   Binaries    → ~/.local/bin/<name>-axi

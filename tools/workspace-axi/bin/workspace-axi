@@ -1,0 +1,1101 @@
+#!/usr/bin/env node
+// workspace-axi — CLI for workspace-mcp server (Google Workspace)
+// Communicates via MCP JSON-RPC over streamable-http.
+// Token-efficient TOON output. Agent-friendly.
+// Zero npm dependencies. Node.js built-ins only.
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+// ── Configuration ───────────────────────────────────
+
+const WORKSPACE_URL = process.env.WORKSPACE_AXI_URL || 'http://localhost:8000';
+
+http.globalAgent.keepAlive = true;
+
+var BASE = new URL(WORKSPACE_URL);
+var PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
+var HOSTNAME = BASE.hostname;
+var PORT = parseInt(BASE.port, 10) || (PROTOCOL === 'https' ? 443 : 80);
+var PATH = BASE.pathname || '/';
+
+// ── MCP state ───────────────────────────────────────
+
+var _initialized = false;
+var _toolSchemas = null;   // { toolName: { inputSchema, description } }
+var _toolMap = null;        // { "category:action": toolName }
+var _serverCapabilities = null;
+
+// ── Low-level MCP JSON-RPC call ─────────────────────
+
+function mcpSend(method, params, id) {
+  var rpc = {
+    jsonrpc: '2.0',
+    method: method,
+    params: params || {}
+  };
+  if (id !== null) {
+    rpc.id = id || Date.now();
+  }
+  var payload = JSON.stringify(rpc);
+
+  return new Promise(function(resolve, reject) {
+    var transport = PROTOCOL === 'https' ? https : http;
+
+    var options = {
+      hostname: HOSTNAME,
+      port: PORT,
+      path: PATH,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    var req = transport.request(options, function(res) {
+      var body = '';
+      res.on('data', function(chunk) { body += chunk.toString(); });
+      res.on('end', function() {
+        if (res.statusCode >= 400) {
+          var preview = body.slice(0, 500);
+          reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
+          return;
+        }
+
+        // Parse SSE stream — find JSON-RPC responses in data: lines
+        var jsonData = null;
+        var lines = body.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.indexOf('data: ') === 0 || line.indexOf('data:') === 0) {
+            var jsonStr = line.slice(line.indexOf(':') + 1).trim();
+            if (jsonStr) {
+              try {
+                var candidate = JSON.parse(jsonStr);
+                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                  // Use the last valid JSON-RPC object (sometimes there are progress events)
+                  jsonData = candidate;
+                }
+              } catch (_) { /* skip non-JSON data lines */ }
+            }
+          }
+        }
+
+        // If no SSE data found, try parsing body as direct JSON-RPC
+        if (!jsonData) {
+          try {
+            var direct = JSON.parse(body);
+            if (direct && typeof direct === 'object') {
+              jsonData = direct;
+            }
+          } catch (_) { /* body is not pure JSON */ }
+        }
+
+        if (!jsonData) {
+          reject(new Error('No valid JSON-RPC response. Body preview: ' + body.slice(0, 300)));
+          return;
+        }
+
+        if (jsonData.error) {
+          reject(new Error(jsonData.error.message || JSON.stringify(jsonData.error)));
+          return;
+        }
+
+        resolve(jsonData.result);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', function(err) {
+      reject(new Error('Connection failed: ' + err.message + ' — Is the workspace-mcp server running at ' + WORKSPACE_URL + '?'));
+    });
+    req.setTimeout(30000, function() {
+      req.destroy();
+      reject(new Error('Request timeout after 30s'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// ── MCP handshake and tool discovery ────────────────
+
+async function ensureInitialized() {
+  if (_initialized) return;
+
+  // Step 1: initialize
+  try {
+    var initResult = await mcpSend('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'workspace-axi', version: '1.0.0' }
+    }, 1);
+    _serverCapabilities = initResult;
+  } catch (e) {
+    throw new Error(
+      'Could not connect to workspace-mcp at ' + WORKSPACE_URL + '. ' +
+      'Is the server running? Error: ' + e.message
+    );
+  }
+
+  // Step 2: send initialized notification (no id, fire-and-forget)
+  try {
+    mcpSend('notifications/initialized', {}, null);
+  } catch (_) { /* ignore */ }
+
+  // Step 3: discover tools
+  var toolsResult;
+  try {
+    toolsResult = await mcpSend('tools/list', {}, 2);
+  } catch (e) {
+    throw new Error(
+      'tools/list failed: ' + e.message + '. ' +
+      'Server at ' + WORKSPACE_URL + ' responded to initialize but failed on tools/list.'
+    );
+  }
+
+  _toolSchemas = {};
+  _toolMap = {};
+
+  if (toolsResult && Array.isArray(toolsResult.tools)) {
+    for (var i = 0; i < toolsResult.tools.length; i++) {
+      var t = toolsResult.tools[i];
+      _toolSchemas[t.name] = {
+        description: t.description || '',
+        inputSchema: t.inputSchema || {}
+      };
+    }
+
+    // Build command-to-tool mapping based on tool name patterns
+    buildToolMap();
+  }
+
+  _initialized = true;
+}
+
+// ── Tool name pattern matching ──────────────────────
+
+function buildToolMap() {
+  var toolNames = Object.keys(_toolSchemas);
+  if (toolNames.length === 0) return;
+
+  // Known command patterns: [category]_[action]_[resource...]
+  // We match tool names to our logical command keys: "category:action"
+
+  // Define expected command keys for each category
+  var expectedCommands = {
+    gmail:    ['list', 'search', 'get', 'send', 'draft', 'labels'],
+    drive:    ['list', 'get', 'search', 'download', 'create'],
+    calendar: ['list', 'get', 'create', 'delete'],
+    docs:     ['get', 'create'],
+    sheets:   ['get', 'create'],
+    contacts: ['search', 'get'],
+    tasks:    ['list', 'create'],
+    chat:     ['list', 'send'],
+    forms:    ['get', 'create'],
+    slides:   ['get', 'create'],
+    search:   ['search'],
+    appscript: ['run']
+  };
+
+  for (var ti = 0; ti < toolNames.length; ti++) {
+    var name = toolNames[ti];
+
+    // Try matching against known categories
+    var matched = false;
+    var cats = Object.keys(expectedCommands);
+    for (var ci = 0; ci < cats.length; ci++) {
+      var cat = cats[ci];
+      if (name.indexOf(cat) === 0) {
+        // Try to extract the action
+        var actions = expectedCommands[cat];
+        for (var ai = 0; ai < actions.length; ai++) {
+          var action = actions[ai];
+          var key = cat + ':' + action;
+
+          // Matching heuristics
+          if (action === 'list' && (name.indexOf('_list_') !== -1 || name.indexOf('_list') !== -1)) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'search' && name.indexOf('_search_') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'get' && name.indexOf('_get_') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'send' && name.indexOf('_send_') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'draft' && name.indexOf('_draft') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'labels' && name.indexOf('_labels') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'download' && name.indexOf('_download') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'create' && name.indexOf('_create_') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'delete' && name.indexOf('_delete_') !== -1) {
+            _toolMap[key] = name; matched = true;
+          } else if (action === 'run' && name.indexOf('_run') !== -1) {
+            _toolMap[key] = name; matched = true;
+          }
+        }
+        if (matched) break;
+      }
+    }
+
+    // Fallback: also match broader patterns
+    // e.g., "google_workspace_search" → "search:search"
+    if (!matched) {
+      if (name.indexOf('_search') !== -1 || name.indexOf('search_') === 0) {
+        if (!_toolMap['search:search']) _toolMap['search:search'] = name;
+      }
+    }
+  }
+}
+
+async function mcpCallTool(toolName, params) {
+  await ensureInitialized();
+  params = params || {};
+
+  var result = await mcpSend('tools/call', {
+    name: toolName,
+    arguments: params
+  }, Date.now());
+
+  // Unwrap MCP tools/call result
+  // Spec: result.content[] → find text content → JSON.parse
+  if (result && Array.isArray(result.content)) {
+    var textItem = null;
+    for (var j = 0; j < result.content.length; j++) {
+      if (result.content[j].type === 'text') {
+        textItem = result.content[j];
+        break;
+      }
+    }
+    if (textItem && typeof textItem.text === 'string') {
+      try {
+        result = JSON.parse(textItem.text);
+      } catch (_) {
+        result = textItem.text;
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── Command dispatch helper ─────────────────────────
+
+async function dispatchCmd(category, action, params, fallbackToolName) {
+  await ensureInitialized();
+
+  var key = category + ':' + action;
+  var toolName = _toolMap[key];
+
+  // If no mapping found via heuristics, try the fallback
+  if (!toolName) {
+    toolName = fallbackToolName;
+  }
+
+  // If still no tool, try fuzzy matching from all known tools
+  if (!toolName) {
+    var toolNames = Object.keys(_toolSchemas);
+    for (var i = 0; i < toolNames.length; i++) {
+      var tn = toolNames[i];
+      if (tn.indexOf(category) !== -1 && tn.indexOf(action) !== -1) {
+        toolName = tn;
+        break;
+      }
+    }
+  }
+
+  if (!toolName) {
+    die('No tool found for ' + key + '. Available tools: ' + Object.keys(_toolSchemas).join(', '));
+  }
+
+  return await mcpCallTool(toolName, params);
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') {
+        return JSON.stringify(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function ok(dataObj) {
+  console.log(toon({ ok: true, data: dataObj }));
+}
+
+// ── Helpers ─────────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+function consumeFlag(args, flag) {
+  var idx = args.indexOf(flag);
+  if (idx === -1) return null;
+  if (idx + 1 < args.length && !args[idx + 1].startsWith('-')) {
+    var val = args[idx + 1];
+    args.splice(idx, 2);
+    return val;
+  }
+  args.splice(idx, 1);
+  return 'true';
+}
+
+function requireArg(args, idx, name) {
+  if (idx >= args.length || args[idx].startsWith('-')) {
+    die('missing ' + name);
+  }
+  return args[idx];
+}
+
+function confirmPrompt(msg) {
+  var readline = require('readline');
+  var rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+
+  return new Promise(function(resolve) {
+    rl.question(msg + ' [y/N] ', function(answer) {
+      rl.close();
+      resolve((answer || '').toLowerCase() === 'y' || (answer || '').toLowerCase() === 'yes');
+    });
+  });
+}
+
+function parseJsonArg(args) {
+  var jsonIdx = args.indexOf('--json');
+  if (jsonIdx !== -1 && jsonIdx + 1 < args.length) {
+    try {
+      var val = JSON.parse(args[jsonIdx + 1]);
+      return val;
+    } catch (e) {
+      die('invalid JSON: ' + e.message);
+    }
+  }
+  return null;
+}
+
+// ── Output formatters ───────────────────────────────
+
+function formatMessageSummary(m) {
+  var parts = [];
+  parts.push(m.id || m.messageId || '?');
+  parts.push(shortenEmail(m.from || (m.headers && m.headers.from) || '?'));
+  parts.push(truncate(m.subject || m.threadId || '(no subject)', 40));
+  parts.push(truncate(m.snippet || m.preview || m.body || '', 50));
+  return parts.join(',');
+}
+
+function formatFileSummary(f) {
+  var parts = [];
+  parts.push(f.id || '?');
+  parts.push(f.name || f.title || '?');
+  parts.push(f.mimeType || f.mime_type || '-');
+  parts.push(f.size ? formatSize(f.size) : '-');
+  return parts.join(',');
+}
+
+function formatEventSummary(ev) {
+  var parts = [];
+  parts.push(ev.id || '?');
+  parts.push(truncate(ev.summary || ev.title || '(no title)', 30));
+  parts.push(ev.start ? (ev.start.dateTime || ev.start.date || ev.start) : '?');
+  parts.push(ev.end ? (ev.end.dateTime || ev.end.date || ev.end) : '');
+  return parts.join(',');
+}
+
+function formatContactSummary(c) {
+  var parts = [];
+  parts.push(c.resourceName || c.id || '?');
+  parts.push(c.names ? c.names[0].displayName : (c.name || '(no name)'));
+  parts.push(c.emailAddresses ? c.emailAddresses[0].value : (c.email || '?'));
+  return parts.join(',');
+}
+
+function formatTaskSummary(t) {
+  var parts = [];
+  parts.push(t.id || '?');
+  parts.push(truncate(t.title || '(no title)', 35));
+  parts.push(t.status || '-');
+  parts.push(t.due ? t.due : '');
+  return parts.join(',');
+}
+
+function shortenEmail(email) {
+  if (!email) return '?';
+  // Extract just the email address from "Name <email>" format
+  var match = email.match(/<([^>]+)>/);
+  if (match) return match[1];
+  match = email.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+  if (match) return match[1];
+  return email.length > 30 ? email.slice(0, 27) + '...' : email;
+}
+
+function truncate(str, maxLen) {
+  if (!str) return '';
+  str = String(str);
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen - 3) + '...';
+}
+
+function formatSize(bytes) {
+  if (bytes === undefined || bytes === null) return '-';
+  if (typeof bytes === 'string') return bytes;
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + 'GB';
+}
+
+// ── Commands ────────────────────────────────────────
+
+// ── Gmail ──────────────────────────────────────────
+
+async function cmdGmailList(args) {
+  var params = {};
+  var limit = consumeFlag(args, '--limit');
+  var query = consumeFlag(args, '--query');
+  if (limit) params.maxResults = parseInt(limit, 10) || 10;
+  if (query) params.q = query;
+
+  var result = await dispatchCmd('gmail', 'list', params, 'gmail_list_messages');
+  var messages = extractList(result, ['messages', 'emails', 'results']);
+
+  if (!Array.isArray(messages)) messages = [];
+
+  console.log('ok: true');
+  var header = query ? ('search[' + messages.length + ']{id,from,subject,snippet}:') : ('messages[' + messages.length + ']{id,from,subject,snippet}:');
+  console.log(header);
+
+  for (var i = 0; i < messages.length; i++) {
+    console.log('  ' + formatMessageSummary(messages[i]));
+  }
+
+  if (messages.length > 0) {
+    console.log('help[' + Math.min(messages.length, 3) + ']:');
+    for (var j = 0; j < Math.min(messages.length, 3); j++) {
+      console.log('  workspace-axi gmail get ' + (messages[j].id || messages[j].messageId || '?'));
+    }
+    console.log('  workspace-axi gmail search "<query>"');
+  }
+}
+
+async function cmdGmailSearch(args) {
+  var query = requireArg(args, 1, 'search query');
+  var params = { q: query };
+  var limit = consumeFlag(args, '--limit');
+  if (limit) params.maxResults = parseInt(limit, 10) || 10;
+
+  var result = await dispatchCmd('gmail', 'search', params, 'gmail_search_messages');
+
+  // Reuse gmail list output format
+  var messages = extractList(result, ['messages', 'emails', 'results']);
+  if (!Array.isArray(messages)) messages = [];
+
+  console.log('ok: true');
+  console.log('search[' + messages.length + ']{id,from,subject,snippet}:');
+  for (var i = 0; i < messages.length; i++) {
+    console.log('  ' + formatMessageSummary(messages[i]));
+  }
+  if (messages.length > 0) {
+    console.log('help[' + Math.min(messages.length, 3) + ']:');
+    for (var j = 0; j < Math.min(messages.length, 3); j++) {
+      console.log('  workspace-axi gmail get ' + (messages[j].id || messages[j].messageId || '?'));
+    }
+  }
+}
+
+async function cmdGmailGet(args) {
+  var messageId = requireArg(args, 1, 'message ID');
+
+  var result = await dispatchCmd('gmail', 'get', { id: messageId, messageId: messageId }, 'gmail_get_message');
+  var msg = result.message || result.email || result;
+
+  console.log('ok: true');
+  console.log(toon(msg));
+
+  if (msg && (msg.id || msg.messageId)) {
+    console.log('\nhelp[2]:');
+    console.log('  workspace-axi gmail get ' + (msg.id || msg.messageId));
+    if (msg.threadId) console.log('  workspace-axi gmail thread ' + msg.threadId);
+  }
+}
+
+async function cmdGmailSend(args) {
+  var to = requireArg(args, 1, 'recipient (to)');
+  var subject = requireArg(args, 2, 'subject');
+  var body = requireArg(args, 3, 'body');
+
+  var params = { to: to, subject: subject, body: body };
+  var cc = consumeFlag(args, '--cc');
+  var bcc = consumeFlag(args, '--bcc');
+  if (cc) params.cc = cc;
+  if (bcc) params.bcc = bcc;
+
+  var result = await dispatchCmd('gmail', 'send', params, 'gmail_send_email');
+  ok(result);
+}
+
+async function cmdGmailDraft(args) {
+  var to = requireArg(args, 1, 'recipient (to)');
+  var subject = requireArg(args, 2, 'subject');
+  var body = requireArg(args, 3, 'body');
+
+  var params = { to: to, subject: subject, body: body };
+  var cc = consumeFlag(args, '--cc');
+  if (cc) params.cc = cc;
+
+  var result = await dispatchCmd('gmail', 'draft', params, 'gmail_create_draft');
+  ok(result);
+}
+
+async function cmdGmailLabels(args) {
+  var result = await dispatchCmd('gmail', 'labels', {}, 'gmail_list_labels');
+  var labels = extractList(result, ['labels', 'results']);
+  if (!Array.isArray(labels)) labels = [];
+
+  console.log('ok: true');
+  console.log('labels[' + labels.length + ']{id,name,type}:');
+  for (var i = 0; i < labels.length; i++) {
+    var l = labels[i];
+    console.log('  ' + [
+      l.id || '?',
+      l.name || '(unnamed)',
+      l.type || (l.labelListVisibility || '-')
+    ].join(','));
+  }
+}
+
+// ── Drive ──────────────────────────────────────────
+
+async function cmdDriveList(args) {
+  var params = {};
+  var query = consumeFlag(args, '--query');
+  var limit = consumeFlag(args, '--limit');
+  if (query) params.q = query;
+  if (limit) params.pageSize = parseInt(limit, 10) || 20;
+
+  var result = await dispatchCmd('drive', 'list', params, 'drive_list_files');
+  var files = extractList(result, ['files', 'results', 'items']);
+  if (!Array.isArray(files)) files = [];
+
+  console.log('ok: true');
+  console.log('files[' + files.length + ']{id,name,mimeType,size}:');
+  for (var i = 0; i < files.length; i++) {
+    console.log('  ' + formatFileSummary(files[i]));
+  }
+  if (files.length > 0) {
+    console.log('help[3]:');
+    for (var j = 0; j < Math.min(files.length, 3); j++) {
+      console.log('  workspace-axi drive get ' + (files[j].id || '?'));
+    }
+    console.log('  workspace-axi drive download ' + (files[0].id || '?'));
+  }
+}
+
+async function cmdDriveGet(args) {
+  var fileId = requireArg(args, 1, 'file ID');
+
+  var result = await dispatchCmd('drive', 'get', { fileId: fileId, id: fileId }, 'drive_get_file');
+  console.log('ok: true');
+  console.log(toon(result));
+
+  if (result && result.id) {
+    console.log('\nhelp[2]:');
+    console.log('  workspace-axi drive download ' + result.id);
+    console.log('  workspace-axi drive get ' + result.id);
+  }
+}
+
+async function cmdDriveSearch(args) {
+  var query = requireArg(args, 1, 'search query');
+  var params = { q: query };
+  var limit = consumeFlag(args, '--limit');
+  if (limit) params.pageSize = parseInt(limit, 10) || 20;
+
+  var result = await dispatchCmd('drive', 'search', params, 'drive_search_files');
+  var files = extractList(result, ['files', 'results', 'items']);
+  if (!Array.isArray(files)) files = [];
+
+  console.log('ok: true');
+  console.log('files[' + files.length + ']{id,name,mimeType,size}:');
+  for (var i = 0; i < files.length; i++) {
+    console.log('  ' + formatFileSummary(files[i]));
+  }
+  if (files.length > 0) {
+    console.log('help[2]:');
+    console.log('  workspace-axi drive get ' + (files[0].id || '?'));
+    console.log('  workspace-axi drive download ' + (files[0].id || '?'));
+  }
+}
+
+async function cmdDriveDownload(args) {
+  var fileId = requireArg(args, 1, 'file ID');
+  var outputPath = consumeFlag(args, '--path') || null;
+
+  var result = await dispatchCmd('drive', 'download', { fileId: fileId, id: fileId }, 'drive_download_file');
+
+  // Result might contain content or a download URL
+  if (outputPath && result && result.content) {
+    var fs = require('fs');
+    var writePath = outputPath;
+    // If path is a directory, append the filename
+    try {
+      if (fs.existsSync(writePath) && fs.statSync(writePath).isDirectory()) {
+        writePath = writePath.replace(/\/$/, '') + '/' + (result.name || result.title || 'downloaded_file');
+      }
+    } catch (_) { /* path doesn't exist, treat as filename */ }
+    fs.writeFileSync(writePath, Buffer.from(result.content, 'base64'));
+    ok({ downloaded: writePath, fileId: fileId });
+  } else {
+    ok(result);
+  }
+}
+
+async function cmdDriveCreate(args) {
+  var name = requireArg(args, 1, 'file/folder name');
+  var params = { name: name };
+  var folder = consumeFlag(args, '--folder');
+  var mimeType = consumeFlag(args, '--mime-type');
+
+  if (folder) params.parents = [folder];
+  if (mimeType) {
+    params.mimeType = mimeType;
+  } else if (hasFlag(args, '--folder')) {
+    // Creating a folder — if --folder flag was consumed above, mimeType not set
+    params.mimeType = 'application/vnd.google-apps.folder';
+  }
+  // Check if --folder flag was a boolean (no value) → it means "create a folder"
+  if (hasFlag(args, '--folder') && !params.parents) {
+    params.mimeType = 'application/vnd.google-apps.folder';
+  }
+
+  var result = await dispatchCmd('drive', 'create', params, 'drive_create_file');
+  ok(result);
+}
+
+// ── Calendar ───────────────────────────────────────
+
+async function cmdCalendarList(args) {
+  var params = {};
+  var from = consumeFlag(args, '--from');
+  var to = consumeFlag(args, '--to');
+  var limit = consumeFlag(args, '--limit');
+  if (from) params.timeMin = from;
+  if (to) params.timeMax = to;
+  if (limit) params.maxResults = parseInt(limit, 10) || 20;
+
+  var result = await dispatchCmd('calendar', 'list', params, 'calendar_list_events');
+  var events = extractList(result, ['events', 'items', 'results']);
+  if (!Array.isArray(events)) events = [];
+
+  console.log('ok: true');
+  console.log('events[' + events.length + ']{id,title,start,end}:');
+  for (var i = 0; i < events.length; i++) {
+    console.log('  ' + formatEventSummary(events[i]));
+  }
+  if (events.length > 0) {
+    console.log('help[2]:');
+    console.log('  workspace-axi calendar get ' + (events[0].id || '?'));
+    console.log('  workspace-axi calendar create "<title>" "<start>" [--end "<end>"]');
+  }
+}
+
+async function cmdCalendarGet(args) {
+  var eventId = requireArg(args, 1, 'event ID');
+
+  var result = await dispatchCmd('calendar', 'get', { eventId: eventId, id: eventId }, 'calendar_get_event');
+  console.log('ok: true');
+  console.log(toon(result));
+}
+
+async function cmdCalendarCreate(args) {
+  var title = requireArg(args, 1, 'event title');
+  var start = requireArg(args, 2, 'start time');
+
+  var params = { summary: title, start: { dateTime: start } };
+  var end = consumeFlag(args, '--end');
+  var location = consumeFlag(args, '--location');
+  var attendees = consumeFlag(args, '--attendees');
+  var description = consumeFlag(args, '--description');
+
+  if (end) params.end = { dateTime: end };
+  if (location) params.location = location;
+  if (description) params.description = description;
+  if (attendees) {
+    params.attendees = attendees.split(',').map(function(a) {
+      return { email: a.trim() };
+    });
+  }
+
+  var result = await dispatchCmd('calendar', 'create', params, 'calendar_create_event');
+  ok(result);
+}
+
+async function cmdCalendarDelete(args) {
+  var eventId = requireArg(args, 1, 'event ID');
+
+  if (!hasFlag(args, '--yes')) {
+    var confirmed = await confirmPrompt('Delete event ' + eventId + '?');
+    if (!confirmed) die('cancelled');
+  }
+
+  var result = await dispatchCmd('calendar', 'delete', { eventId: eventId, id: eventId }, 'calendar_delete_event');
+  ok(result || { deleted: eventId });
+}
+
+// ── Docs ────────────────────────────────────────────
+
+async function cmdDocsGet(args) {
+  var docId = requireArg(args, 1, 'document ID');
+
+  var result = await dispatchCmd('docs', 'get', { documentId: docId, id: docId }, 'docs_get_document');
+  console.log('ok: true');
+  console.log(toon(result));
+}
+
+async function cmdDocsCreate(args) {
+  var title = requireArg(args, 1, 'document title');
+  var content = consumeFlag(args, '--content') || '';
+
+  var params = { title: title };
+  if (content) params.content = content;
+
+  var result = await dispatchCmd('docs', 'create', params, 'docs_create_document');
+  ok(result);
+}
+
+// ── Contacts ────────────────────────────────────────
+
+async function cmdContactsSearch(args) {
+  var query = requireArg(args, 1, 'contact query');
+
+  var result = await dispatchCmd('contacts', 'search', { query: query, q: query }, 'contacts_search');
+  var contacts = extractList(result, ['contacts', 'results', 'connections']);
+  if (!Array.isArray(contacts)) contacts = [];
+
+  console.log('ok: true');
+  console.log('contacts[' + contacts.length + ']{id,name,email}:');
+  for (var i = 0; i < contacts.length; i++) {
+    console.log('  ' + formatContactSummary(contacts[i]));
+  }
+  if (contacts.length > 0) {
+    console.log('help[1]:');
+    console.log('  workspace-axi contacts get ' + (contacts[0].resourceName || contacts[0].id || '?'));
+  }
+}
+
+async function cmdContactsGet(args) {
+  var contactId = requireArg(args, 1, 'contact ID');
+
+  var result = await dispatchCmd('contacts', 'get', { resourceName: contactId, id: contactId }, 'contacts_get_contact');
+  console.log('ok: true');
+  console.log(toon(result));
+}
+
+// ── Tasks ───────────────────────────────────────────
+
+async function cmdTasksList(args) {
+  var params = {};
+  var listName = consumeFlag(args, '--list');
+  if (listName) params.tasklist = listName;
+
+  var result = await dispatchCmd('tasks', 'list', params, 'tasks_list_tasks');
+  var tasks = extractList(result, ['tasks', 'items', 'results']);
+  if (!Array.isArray(tasks)) tasks = [];
+
+  console.log('ok: true');
+  console.log('tasks[' + tasks.length + ']{id,title,status,due}:');
+  for (var i = 0; i < tasks.length; i++) {
+    console.log('  ' + formatTaskSummary(tasks[i]));
+  }
+  if (tasks.length > 0) {
+    console.log('help[1]:');
+    console.log('  workspace-axi tasks create "<title>" [--list "<name>"] [--due "<date>"]');
+  }
+}
+
+async function cmdTasksCreate(args) {
+  var title = requireArg(args, 1, 'task title');
+  var params = { title: title };
+  var listName = consumeFlag(args, '--list');
+  var due = consumeFlag(args, '--due');
+  if (listName) params.tasklist = listName;
+  if (due) params.due = due;
+
+  var result = await dispatchCmd('tasks', 'create', params, 'tasks_create_task');
+  ok(result);
+}
+
+// ── Status ──────────────────────────────────────────
+
+async function cmdStatus(args) {
+  try {
+    await ensureInitialized();
+    var toolCount = _toolSchemas ? Object.keys(_toolSchemas).length : 0;
+    var mappedCount = _toolMap ? Object.keys(_toolMap).length : 0;
+
+    console.log('ok: true');
+    console.log(toon({
+      status: 'connected',
+      url: WORKSPACE_URL,
+      protocolVersion: (_serverCapabilities && _serverCapabilities.protocolVersion) || '2024-11-05',
+      serverName: (_serverCapabilities && _serverCapabilities.serverInfo && _serverCapabilities.serverInfo.name) || 'unknown',
+      tools: toolCount,
+      mapped: mappedCount
+    }));
+
+    // Show discovered tools
+    if (_toolSchemas && toolCount > 0) {
+      console.log('\ntools[' + toolCount + ']{name,description}:');
+      var names = Object.keys(_toolSchemas).sort();
+      for (var i = 0; i < names.length; i++) {
+        var n = names[i];
+        var d = _toolSchemas[n].description || '';
+        console.log('  ' + n + ',' + truncate(d, 60));
+      }
+    }
+
+    // Show command mapping
+    if (_toolMap && mappedCount > 0) {
+      console.log('\ncommands[' + mappedCount + ']{key,tool}:');
+      var keys = Object.keys(_toolMap).sort();
+      for (var k = 0; k < keys.length; k++) {
+        console.log('  ' + keys[k] + ' → ' + _toolMap[keys[k]]);
+      }
+    }
+  } catch (e) {
+    ok({ status: 'error', error: e.message, url: WORKSPACE_URL });
+    process.exit(1);
+  }
+}
+
+// ── Call (passthrough) ──────────────────────────────
+
+async function cmdCall(args) {
+  var toolName = requireArg(args, 1, 'tool name');
+  var params = parseJsonArg(args);
+
+  if (!params) {
+    params = {};
+    for (var i = 2; i < args.length; i++) {
+      if (args[i].startsWith('--')) {
+        var key = args[i].slice(2);
+        if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+          params[key] = args[i + 1];
+          i++;
+        } else {
+          params[key] = true;
+        }
+      }
+    }
+  }
+
+  var result = await mcpCallTool(toolName, params);
+  ok(result);
+}
+
+// ── Help ────────────────────────────────────────────
+
+function cmdHelp() {
+  console.log('workspace-axi <command> [options]');
+  console.log('');
+  console.log('Gmail:');
+  console.log('  gmail list [--limit N] [--query q]          List Gmail messages');
+  console.log('  gmail search <query> [--limit N]             Search Gmail');
+  console.log('  gmail get <message-id>                       Get specific email');
+  console.log('  gmail send <to> <subject> <body> [--cc addr] [--bcc addr]  Send email');
+  console.log('  gmail draft <to> <subject> <body> [--cc addr]  Create draft');
+  console.log('  gmail labels                                  List Gmail labels');
+  console.log('');
+  console.log('Drive:');
+  console.log('  drive list [--query q] [--limit N]           List Drive files');
+  console.log('  drive get <file-id>                          Get file metadata');
+  console.log('  drive search <query> [--limit N]             Search Drive files');
+  console.log('  drive download <file-id> [--path p]          Download file content');
+  console.log('  drive create <name> [--folder id] [--mime-type t]  Create file/folder');
+  console.log('');
+  console.log('Calendar:');
+  console.log('  calendar list [--from d] [--to d] [--limit N]  List events');
+  console.log('  calendar get <event-id>                      Get event details');
+  console.log('  calendar create <title> <start> [--end e] [--location l] [--attendees emails]  Create event');
+  console.log('  calendar delete <event-id> [--yes]           Delete event (confirm)');
+  console.log('');
+  console.log('Docs:');
+  console.log('  docs get <doc-id>                            Get document content');
+  console.log('  docs create <title> [--content text]         Create document');
+  console.log('');
+  console.log('Contacts:');
+  console.log('  contacts search <query>                      Search contacts');
+  console.log('  contacts get <contact-id>                    Get contact');
+  console.log('');
+  console.log('Tasks:');
+  console.log('  tasks list [--list name]                     List tasks');
+  console.log('  tasks create <title> [--list name] [--due date]  Create task');
+  console.log('');
+  console.log('Generic:');
+  console.log('  status                                       Health check + discovered tools');
+  console.log('  call <tool-name> --json \'{"k":"v"}\'           Call any MCP tool directly');
+  console.log('  call <tool-name> --key val --key2 val2       Call with key=value args');
+  console.log('  help                                         Show this help');
+  console.log('');
+  console.log('Env: WORKSPACE_AXI_URL (default: http://localhost:8000)');
+}
+
+// ── Utility ─────────────────────────────────────────
+
+function extractList(result, tryKeys) {
+  if (Array.isArray(result)) return result;
+  for (var i = 0; i < tryKeys.length; i++) {
+    var val = result[tryKeys[i]];
+    if (Array.isArray(val)) return val;
+  }
+  return [];
+}
+
+// ── CLI routing ─────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+if (!cmd || cmd === '--help' || cmd === '-h') {
+  cmdHelp();
+  process.exit(0);
+}
+
+if (cmd === 'help') {
+  cmdHelp();
+  process.exit(0);
+}
+
+// Build a dispatch table for category:action
+var commandDispatch = {
+  'gmail:list':     cmdGmailList,
+  'gmail:search':   cmdGmailSearch,
+  'gmail:get':      cmdGmailGet,
+  'gmail:send':     cmdGmailSend,
+  'gmail:draft':    cmdGmailDraft,
+  'gmail:labels':   cmdGmailLabels,
+  'drive:list':     cmdDriveList,
+  'drive:get':      cmdDriveGet,
+  'drive:search':   cmdDriveSearch,
+  'drive:download': cmdDriveDownload,
+  'drive:create':   cmdDriveCreate,
+  'calendar:list':   cmdCalendarList,
+  'calendar:get':    cmdCalendarGet,
+  'calendar:create': cmdCalendarCreate,
+  'calendar:delete': cmdCalendarDelete,
+  'docs:get':       cmdDocsGet,
+  'docs:create':    cmdDocsCreate,
+  'contacts:search': cmdContactsSearch,
+  'contacts:get':    cmdContactsGet,
+  'tasks:list':     cmdTasksList,
+  'tasks:create':   cmdTasksCreate,
+  'status':         cmdStatus,
+  'call':           cmdCall,
+  'help':           function() { cmdHelp(); }
+};
+
+(async function main() {
+  try {
+    // Single-word commands
+    if (cmd === 'status') {
+      await cmdStatus(args);
+      return;
+    }
+    if (cmd === 'call') {
+      await cmdCall(args);
+      return;
+    }
+    if (cmd === 'help') {
+      cmdHelp();
+      return;
+    }
+
+    // Two-word commands: "category action"
+    var action = args[1];
+    var dispatchKey = cmd + ':' + action;
+    var handler = commandDispatch[dispatchKey];
+
+    if (handler) {
+      await handler(args);
+    } else {
+      // Try listing available actions for this category
+      var suggestions = [];
+      var dispatchKeys = Object.keys(commandDispatch);
+      for (var i = 0; i < dispatchKeys.length; i++) {
+        if (dispatchKeys[i].startsWith(cmd + ':')) {
+          suggestions.push('  workspace-axi ' + dispatchKeys[i].replace(':', ' '));
+        }
+      }
+      if (suggestions.length > 0) {
+        die('unknown subcommand: ' + action + ' for ' + cmd + '. Available:\n' + suggestions.join('\n'));
+      } else {
+        die('unknown command: ' + cmd + ' (use --help to see all commands)');
+      }
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();
