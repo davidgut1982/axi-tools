@@ -1,0 +1,19 @@
+{
+  "name": "vector-indexer-axi",
+  "version": "1.0.0",
+  "description": "Codebase search — 105K files, 694K chunks indexed",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "VECTOR_INDEXER_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "search", "desc": "Full-text keyword search", "args": ["<query>", "--limit"]},
+    {"name": "semantic", "desc": "Semantic similarity search", "args": ["<query>", "--limit"]},
+    {"name": "hybrid", "desc": "Combined lexical + semantic", "args": ["<query>", "--limit"]},
+    {"name": "chunks", "desc": "Get indexed chunks for a file", "args": ["<file-path>"]},
+    {"name": "status", "desc": "Index health", "args": []},
+    {"name": "reindex", "desc": "Re-index a path", "args": ["<path>", "--recursive", "--force"]}
+  ],
+  "plugin": "plugin/axi-vector-indexer-axi.js"
+}

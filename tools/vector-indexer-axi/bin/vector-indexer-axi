@@ -1,0 +1,146 @@
+#!/usr/bin/env node
+// vector-indexer-axi — CLI for vector-indexer-mcp code search
+const http = require('http');
+
+const BASE = process.env.VECTOR_INDEXER_AXI_URL || 'http://127.0.0.1:5577';
+const HOST = new URL(BASE).hostname;
+const PORT = parseInt(new URL(BASE).port, 10) || 5577;
+
+function mcpCall(tool, args) {
+  return new Promise((resolve, reject) => {
+    let buf = '', ep = null, step = 0, timer;
+    timer = setTimeout(() => { sseReq.destroy(); reject(new Error('timeout after 30s')); }, 30000);
+
+    function post(id, method, params) {
+      const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+      const r = http.request({ hostname: HOST, port: PORT, path: ep, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      }, (res) => { res.resume(); });
+      r.on('error', (e) => { clearTimeout(timer); reject(e); });
+      r.write(body);
+      r.end();
+    }
+
+    const sseReq = http.get(`http://${HOST}:${PORT}/sse`, (sseRes) => {
+      sseRes.on('data', (chunk) => {
+        buf += chunk;
+        if (!ep) { const m = buf.match(/data:\s*(\/messages\/\?[^\r\n]+)/); if (m) ep = m[1]; }
+
+        if (ep && step === 0) { step = 1; post(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'axi', version: '1.0' } }); }
+
+        if (step === 1 && buf.includes('"serverInfo"')) { step = 2; post(2, 'tools/call', { name: tool, arguments: args || {} }); }
+
+        // Parse SSE events for the tools/call response (id=2)
+        const events = buf.split(/\r?\n\r?\n/);
+        for (const evt of events) {
+          const dl = evt.split(/\r?\n/).filter(l => l.startsWith('data: '));
+          for (const d of dl) {
+            try {
+              const r = JSON.parse(d.slice(6));
+              if (r.id === 2) {
+                clearTimeout(timer);
+                sseReq.destroy();
+                if (r.error) return reject(new Error(r.error.message));
+                if (r.result) {
+                  try { return resolve(JSON.parse(r.result.content[0].text)); }
+                  catch { return resolve(r.result); }
+                }
+              }
+            } catch {}
+          }
+        }
+      });
+      sseRes.on('error', (e) => { clearTimeout(timer); reject(e); });
+    });
+    sseReq.on('error', (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+// ── TOON output ──────────────────────────────────
+function toon(obj, indent) {
+  indent = indent || 0;
+  if (obj === null || obj === undefined) return 'null';
+  if (typeof obj === 'boolean' || typeof obj === 'number') return String(obj);
+  if (typeof obj === 'string') {
+    if (obj.length > 300) obj = obj.slice(0, 297) + '...';
+    if (/[:#!@`\n\r\\"'\[\]{}]|^\s|\s$/.test(obj) || obj === '') return JSON.stringify(obj);
+    return obj;
+  }
+  const pad = '  '.repeat(indent);
+  if (Array.isArray(obj)) {
+    if (obj.length === 0) return '[]';
+    return '[' + obj.length + ']\n' + obj.map((item, i) => {
+      const v = toon(item, indent + 1);
+      return pad + '  - ' + (typeof item === 'object' && item && !Array.isArray(item) ? v.replace(/^\n/, '') : v);
+    }).join('\n');
+  }
+  if (typeof obj === 'object') {
+    const keys = Object.keys(obj);
+    if (keys.length === 0) return '{}';
+    return '\n' + keys.map(k => pad + '  ' + k + ': ' + toon(obj[k], indent + 1)).join('\n');
+  }
+  return String(obj);
+}
+function die(msg) { console.log(toon({ ok: false, error: msg })); process.exit(1); }
+function ok(data) { console.log(toon({ ok: true, data })); }
+
+// ── CLI ──────────────────────────────────────────
+const args = process.argv.slice(2), cmd = args[0];
+function flag(k) { const i = args.indexOf(k); return i >= 0 && i + 1 < args.length ? args[i + 1] : null; }
+
+if (!cmd) {
+  console.log('vector-indexer-axi <command> [options]');
+  console.log('  search <query> [--limit 20]          Full-text keyword search (105K files)');
+  console.log('  semantic <query> [--limit 20]        Semantic similarity search');
+  console.log('  hybrid <query> [--limit 20]          Combined lexical + semantic');
+  console.log('  chunks <file-path>                   Get indexed chunks for a file');
+  console.log('  status                               Index health (105K files, 694K chunks)');
+  console.log('  reindex <path> [--recursive] [--force]  Re-index a path');
+  process.exit(0);
+}
+
+(async () => {
+  try {
+    switch (cmd) {
+      case 'search': {
+        const q = args[1]; if (!q) die('missing <query>');
+        const r = await mcpCall('search_lexical', { query: q, limit: parseInt(flag('--limit'), 10) || 20 });
+        const arr = Array.isArray(r) ? r : (r.results || []);
+        ok({ query: q, count: arr.length, results: arr.slice(0, 10) });
+        break;
+      }
+      case 'semantic': {
+        const q = args[1]; if (!q) die('missing <query>');
+        const r = await mcpCall('search_semantic', { query: q, limit: parseInt(flag('--limit'), 10) || 20, threshold: parseFloat(flag('--threshold')) || 0.5 });
+        const arr = Array.isArray(r) ? r : (r.results || []);
+        ok({ query: q, count: arr.length, results: arr.slice(0, 10) });
+        break;
+      }
+      case 'hybrid': {
+        const q = args[1]; if (!q) die('missing <query>');
+        const r = await mcpCall('search_hybrid', { query: q, limit: parseInt(flag('--limit'), 10) || 20 });
+        const arr = Array.isArray(r) ? r : (r.results || []);
+        ok({ query: q, count: arr.length, results: arr.slice(0, 10) });
+        break;
+      }
+      case 'chunks': {
+        const p = args[1]; if (!p) die('missing <path>');
+        const r = await mcpCall('get_file_chunks', { file_path: p });
+        ok(r);
+        break;
+      }
+      case 'status': {
+        const r = await mcpCall('index_status', {});
+        ok(r.health || r);
+        break;
+      }
+      case 'reindex': {
+        const p = args[1]; if (!p) die('missing <path>');
+        const r = await mcpCall('reindex_path', { path: p, recursive: args.includes('--recursive'), force: args.includes('--force') });
+        ok(r.data || r);
+        break;
+      }
+      default: die('unknown command: ' + cmd);
+    }
+  } catch (e) { die(e.message || String(e)); }
+})();

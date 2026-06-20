@@ -1,0 +1,402 @@
+#!/usr/bin/env node
+'use strict';
+
+// ── AXI CLI Manager v1.0.0 ──────────────────────────────────────────────
+// Single-file Node.js CLI. No npm dependencies. Uses built-in https/fs/os.
+// Manages installation of all AXI tools.
+// ─────────────────────────────────────────────────────────────────────────
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// ── Constants ───────────────────────────────────────────────────────────
+
+const REPO_RAW = 'https://raw.githubusercontent.com/davidgut1982/axi-tools/main';
+const REGISTRY_URL = `${REPO_RAW}/registry.json`;
+
+const HOME = os.homedir();
+const BIN_DIR = path.join(HOME, '.local', 'bin');
+const PLUGIN_DIR = path.join(HOME, '.config', 'opencode', 'plugins');
+const SKILL_DIR = path.join(HOME, '.config', 'opencode', 'skills');
+
+// ── HTTP helpers ────────────────────────────────────────────────────────
+
+function fetchText(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'axi-cli/1.0' } }, (res) => {
+      // Follow redirects
+      if (res.statusCode >= 301 && res.statusCode <= 303 && res.headers.location) {
+        return resolve(fetchText(res.headers.location));
+      }
+      // 404 is not an error — the file just doesn't exist
+      if (res.statusCode === 404) {
+        return resolve(null);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} — ${url}`));
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+    req.on('error', (e) => reject(new Error(`Fetch failed: ${e.message} — ${url}`)));
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error(`Timeout — ${url}`)); });
+  });
+}
+
+async function fetchJSON(url) {
+  const text = await fetchText(url);
+  if (text === null) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// ── File helpers ────────────────────────────────────────────────────────
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function fileExists(p) {
+  try { fs.accessSync(p, fs.constants.F_OK); return true; } catch { return false; }
+}
+
+// ── Registry ────────────────────────────────────────────────────────────
+
+let _registryCache = null;
+
+async function getRegistry() {
+  if (_registryCache) return _registryCache;
+  const data = await fetchJSON(REGISTRY_URL);
+  if (!data || !data.tools) {
+    throw new Error('Failed to fetch registry. Check your internet connection.');
+  }
+  _registryCache = data.tools;
+  return data.tools;
+}
+
+async function findTool(name) {
+  const tools = await getRegistry();
+  // Accept both "gh-axi" and "gh" as names
+  const exact = tools.find((t) => t.name === name);
+  if (exact) return exact;
+  const fuzzy = tools.find((t) => t.name === `${name}-axi`);
+  if (fuzzy) return fuzzy;
+  return null;
+}
+
+// ── URL builders ────────────────────────────────────────────────────────
+
+function binURL(tool) {
+  return `${REPO_RAW}/tools/${tool.name}/bin/${tool.name}`;
+}
+
+function pluginURL(tool) {
+  return `${REPO_RAW}/tools/${tool.name}/plugin/axi-${tool.name}.js`;
+}
+
+function skillURL(tool) {
+  return `${REPO_RAW}/tools/${tool.name}/skill/SKILL.md`;
+}
+
+// ── Install / Update ────────────────────────────────────────────────────
+
+async function installOne(tool, verbose) {
+  const name = tool.name;
+  const results = { name, bin: false, plugin: false, skill: false };
+
+  // 1. Bin
+  if (verbose) process.stdout.write(`  ${name} … bin`);
+  const binPath = path.join(BIN_DIR, name);
+  const binData = await fetchText(binURL(tool));
+  if (binData !== null) {
+    ensureDir(BIN_DIR);
+    fs.writeFileSync(binPath, binData);
+    fs.chmodSync(binPath, 0o755);
+    results.bin = true;
+    if (verbose) process.stdout.write(' ✓');
+  } else {
+    if (verbose) process.stdout.write(' ✗ (not found)');
+  }
+
+  // 2. Plugin
+  if (tool.has_plugin) {
+    if (verbose) process.stdout.write(', plugin');
+    const pluginPath = path.join(PLUGIN_DIR, `axi-${name}.js`);
+    const pluginData = await fetchText(pluginURL(tool));
+    if (pluginData !== null) {
+      ensureDir(PLUGIN_DIR);
+      fs.writeFileSync(pluginPath, pluginData);
+      results.plugin = true;
+      if (verbose) process.stdout.write(' ✓');
+    } else {
+      if (verbose) process.stdout.write(' ✗');
+    }
+  }
+
+  // 3. Skill
+  if (tool.has_skill) {
+    if (verbose) process.stdout.write(', skill');
+    const skillPath = path.join(SKILL_DIR, `${name}`, 'SKILL.md');
+    const skillData = await fetchText(skillURL(tool));
+    if (skillData !== null) {
+      ensureDir(path.dirname(skillPath));
+      fs.writeFileSync(skillPath, skillData);
+      results.skill = true;
+      if (verbose) process.stdout.write(' ✓');
+    } else {
+      if (verbose) process.stdout.write(' ✗');
+    }
+  }
+
+  if (verbose) console.log('');
+  return results;
+}
+
+async function installCommand(target) {
+  if (target === '--all') {
+    const tools = await getRegistry();
+    console.log(`Installing all ${tools.length} AXI tools:\n`);
+    const results = [];
+    for (const tool of tools) {
+      results.push(await installOne(tool, true));
+    }
+    console.log(`\nDone. ${results.filter((r) => r.bin).length}/${tools.length} installed.\n`);
+    printAllEnvHints(tools);
+    return;
+  }
+
+  const tool = await findTool(target);
+  if (!tool) {
+    console.error(`Unknown tool: "${target}". Run \`axi list\` to see available tools.`);
+    process.exit(2);
+  }
+
+  console.log(`Installing ${tool.name} v${tool.version}:\n`);
+  const result = await installOne(tool, true);
+  if (!result.bin) {
+    console.error(`\nFailed to install ${tool.name}. The binary was not found at the expected URL.`);
+    process.exit(1);
+  }
+  console.log(`\n${tool.name} installed.\n`);
+  printEnvHints(tool);
+}
+
+// ── Update ──────────────────────────────────────────────────────────────
+
+async function updateCommand(target) {
+  const tool = await findTool(target);
+  if (!tool) {
+    console.error(`Unknown tool: "${target}". Run \`axi list\` to see available tools.`);
+    process.exit(2);
+  }
+  console.log(`Updating ${tool.name} to latest version:\n`);
+  const result = await installOne(tool, true);
+  console.log(`\n${tool.name} updated.\n`);
+}
+
+// ── List ────────────────────────────────────────────────────────────────
+
+async function listCommand() {
+  const tools = await getRegistry();
+
+  // Column widths
+  const nameW = Math.max(...tools.map((t) => t.name.length), 4);
+  const verW = 7;
+  const descW = 60;
+
+  // Header
+  console.log(`${'Name'.padEnd(nameW)}  ${'Version'.padEnd(verW)}  Status   ${'Description'}`);
+  console.log(`${'─'.repeat(nameW)}  ${'─'.repeat(verW)}  ${'─'.repeat(6)}  ${'─'.repeat(descW)}`);
+
+  for (const tool of tools) {
+    const binPath = path.join(BIN_DIR, tool.name);
+    const installed = fileExists(binPath);
+    const icon = installed ? '✅' : '⬜';
+    const desc = tool.description.length > descW
+      ? tool.description.slice(0, descW - 1) + '…'
+      : tool.description;
+    console.log(
+      `${tool.name.padEnd(nameW)}  ${tool.version.padEnd(verW)}  ${icon}       ${desc}`
+    );
+  }
+
+  const installedCount = tools.filter((t) => fileExists(path.join(BIN_DIR, t.name))).length;
+  console.log(`\n${installedCount}/${tools.length} installed.`);
+}
+
+// ── Status ──────────────────────────────────────────────────────────────
+
+async function statusCommand() {
+  const tools = await getRegistry();
+  console.log('AXI Tool Status\n');
+
+  let checked = 0;
+  let ok = 0;
+
+  for (const tool of tools) {
+    const binPath = path.join(BIN_DIR, tool.name);
+    if (!fileExists(binPath)) continue;
+    checked++;
+
+    // Try to invoke the tool's status command
+    const status = await checkToolStatus(tool.name, binPath);
+    const icon = status.ok ? '✅' : '⚠️';
+    console.log(`${icon} ${tool.name}  v${tool.version}${status.ok ? '' : '  (' + status.error + ')'}`);
+    if (status.ok) ok++;
+  }
+
+  if (checked === 0) {
+    console.log('No AXIs installed. Run `axi install --all` to install all tools.');
+  } else {
+    console.log(`\n${ok}/${checked} healthy.`);
+  }
+}
+
+function checkToolStatus(name, binPath) {
+  return new Promise((resolve) => {
+    const { spawn } = require('child_process');
+    const child = spawn(binPath, ['status'], {
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (d) => { output += d.toString(); });
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ ok: true });
+      } else {
+        resolve({ ok: false, error: `exit code ${code}` });
+      }
+    });
+    child.on('error', () => {
+      resolve({ ok: false, error: 'exec failed' });
+    });
+  });
+}
+
+// ── Env hints ───────────────────────────────────────────────────────────
+
+function printEnvHints(tool) {
+  const envs = tool.env || {};
+  const keys = Object.keys(envs);
+  if (keys.length === 0) return;
+
+  console.log('Environment variables to set:\n');
+  for (const [key, desc] of Object.entries(envs)) {
+    console.log(`  export ${key}=<${desc}>`);
+  }
+  console.log('');
+}
+
+function printAllEnvHints(tools) {
+  let any = false;
+  for (const tool of tools) {
+    const keys = Object.keys(tool.env || {});
+    if (keys.length === 0) continue;
+    if (!any) {
+      console.log('Environment variables to set:\n');
+      any = true;
+    }
+    console.log(`  # ${tool.name}`);
+    for (const [key, desc] of Object.entries(tool.env)) {
+      console.log(`  export ${key}=<${desc}>`);
+    }
+    console.log('');
+  }
+}
+
+// ── Help ────────────────────────────────────────────────────────────────
+
+function helpCommand() {
+  console.log(`
+AXI Manager — Agent eXecution Interface toolkit
+
+USAGE
+  axi <command> [options]
+
+COMMANDS
+  install <name>       Install a specific AXI tool
+  install --all         Install all 8 AXI tools
+  list                  List available vs installed AXIs
+  update <name>         Re-download latest version of a tool
+  status                Health-check installed AXIs
+  help                  Show this help
+
+EXAMPLES
+  axi install gh-axi
+  axi install --all
+  axi list
+  axi status
+
+TOOLS
+  cluster-ops-axi    Proxmox cluster operations
+  lore-axi            Knowledge base, journal, investigations
+  langfuse-axi        LLM observability (traces, prompts)
+  kanban-axi          Project boards and task tracking
+  vector-indexer-axi  Codebase semantic/lexical search
+  codeintel-axi       LSP-based code intelligence
+  gh-axi              GitHub operations
+  npm-axi             npm registry search
+
+INSTALL PATHS
+  Binaries    → ~/.local/bin/<name>-axi
+  Plugins     → ~/.config/opencode/plugins/axi-<name>-axi.js
+  Skills      → ~/.config/opencode/skills/<name>-axi/SKILL.md
+`.trim() + '\n');
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+  const target = args[1];
+
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    helpCommand();
+    return;
+  }
+
+  try {
+    switch (cmd) {
+      case 'install':
+        if (!target) {
+          console.error('Usage: axi install <name> | --all');
+          process.exit(2);
+        }
+        await installCommand(target);
+        break;
+
+      case 'update':
+        if (!target) {
+          console.error('Usage: axi update <name>');
+          process.exit(2);
+        }
+        await updateCommand(target);
+        break;
+
+      case 'list':
+        await listCommand();
+        break;
+
+      case 'status':
+        await statusCommand();
+        break;
+
+      default:
+        console.error(`Unknown command: "${cmd}". Run \`axi help\` for usage.`);
+        process.exit(2);
+    }
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+main();

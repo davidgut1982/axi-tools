@@ -1,0 +1,21 @@
+{
+  "name": "langfuse-axi",
+  "version": "1.0.0",
+  "description": "LLM observability — traces, prompts, sessions",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "LANGFUSE_AXI_URL": "",
+    "LANGFUSE_AXI_PK": "",
+    "LANGFUSE_AXI_SK": ""
+  },
+  "commands": [
+    {"name": "traces", "desc": "List recent traces", "args": ["--limit"]},
+    {"name": "trace", "desc": "Trace detail", "args": ["<id>"]},
+    {"name": "prompts", "desc": "List prompts", "args": ["--limit"]},
+    {"name": "prompt", "desc": "Prompt detail", "args": ["<name>"]},
+    {"name": "status", "desc": "Health check", "args": []},
+    {"name": "sessions", "desc": "List sessions", "args": ["--limit"]}
+  ],
+  "plugin": "plugin/axi-langfuse-axi.js"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "kanban-axi",
+  "version": "1.0.0",
+  "description": "Project boards and task tracking",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "KANBAN_AXI_URL": "",
+    "KANBAN_AXI_TOKEN": ""
+  },
+  "commands": [
+    {"name": "board", "desc": "Board overview", "args": ["--board"]},
+    {"name": "tasks", "desc": "List tasks", "args": ["--column", "--assignee", "--board"]},
+    {"name": "task", "desc": "Task detail", "args": ["<id>", "--board"]},
+    {"name": "create", "desc": "Create task", "args": ["<title>", "--body", "--assignee", "--priority", "--triage", "--board"]},
+    {"name": "update", "desc": "Update task", "args": ["<id>", "--status", "--assignee", "--title", "--body", "--priority"]},
+    {"name": "delete", "desc": "Delete task", "args": ["<id>", "--board"]},
+    {"name": "boards", "desc": "List all boards", "args": []},
+    {"name": "status", "desc": "Health check", "args": []}
+  ],
+  "plugin": "plugin/axi-kanban-axi.js"
+}

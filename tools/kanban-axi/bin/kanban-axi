@@ -1,0 +1,431 @@
+#!/usr/bin/env node
+// kanban-axi — CLI for hermes-kanban board API
+// Communicates via MCP JSON-RPC over SSE transport.
+// Token-efficient TOON output. Agent-friendly.
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+// ── Configuration ───────────────────────────────────
+
+const KANBAN_URL = process.env.KANBAN_AXI_URL || 'http://hermes.internal.shifting-ground.link:8011/mcp';
+const KANBAN_TOKEN = process.env.KANBAN_AXI_TOKEN || 'vy34i1k40ytLizeFUdMsJgaKlgx08ELgaKU5yTVIJf0';
+
+http.globalAgent.keepAlive = true;
+
+var BASE = new URL(KANBAN_URL);
+var PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
+var HOSTNAME = BASE.hostname;
+var PORT = parseInt(BASE.port, 10) || (PROTOCOL === 'https' ? 443 : 80);
+
+// ── SSE-aware MCP JSON-RPC call ─────────────────────
+
+function mcpCall(toolName, params) {
+  params = params || {};
+  var id = Date.now();
+  var payload = JSON.stringify({
+    jsonrpc: '2.0',
+    id: id,
+    method: 'tools/call',
+    params: {
+      name: toolName,
+      arguments: params
+    }
+  });
+
+  return new Promise(function(resolve, reject) {
+    var transport = PROTOCOL === 'https' ? https : http;
+
+    var options = {
+      hostname: HOSTNAME,
+      port: PORT,
+      path: BASE.pathname + BASE.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Authorization': 'Bearer ' + KANBAN_TOKEN,
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    var req = transport.request(options, function(res) {
+      var body = '';
+      res.on('data', function(chunk) { body += chunk.toString(); });
+      res.on('end', function() {
+        if (res.statusCode >= 400) {
+          // Try to extract error detail from body
+          var preview = body.slice(0, 500);
+          reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
+          return;
+        }
+
+        // Parse SSE stream — find the JSON-RPC response in data: lines
+        var jsonData = null;
+        var lines = body.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.indexOf('data: ') === 0 || line.indexOf('data:') === 0) {
+            var jsonStr = line.slice(line.indexOf(':') + 1).trim();
+            if (jsonStr) {
+              try {
+                var candidate = JSON.parse(jsonStr);
+                // Take the last valid JSON-RPC response (covers [DONE] and other non-objects)
+                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                  jsonData = candidate;
+                }
+              } catch (_) { /* skip non-JSON data lines */ }
+            }
+          }
+        }
+
+        if (!jsonData) {
+          reject(new Error('No valid JSON-RPC response in SSE stream. Body preview: ' + body.slice(0, 300)));
+          return;
+        }
+
+        if (jsonData.error) {
+          reject(new Error(jsonData.error.message || JSON.stringify(jsonData.error)));
+          return;
+        }
+
+        // Unwrap MCP tools/call result
+        // Spec: result.content[] → find text content → JSON.parse
+        var result = jsonData.result;
+        if (result && Array.isArray(result.content)) {
+          var textItem = null;
+          for (var j = 0; j < result.content.length; j++) {
+            if (result.content[j].type === 'text') {
+              textItem = result.content[j];
+              break;
+            }
+          }
+          if (textItem && typeof textItem.text === 'string') {
+            try {
+              result = JSON.parse(textItem.text);
+            } catch (_) {
+              result = textItem.text;
+            }
+          }
+        }
+
+        resolve(result);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, function() {
+      req.destroy();
+      reject(new Error('request timeout after 30s'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') {
+        return JSON.stringify(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function ok(dataObj) {
+  console.log(toon({ ok: true, data: dataObj }));
+}
+
+// ── Helpers ─────────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+// ── Commands ────────────────────────────────────────
+
+async function cmdBoard(args) {
+  var params = {};
+  var board = flagVal(args, '--board');
+  if (board) params.board = board;
+
+  var result = await mcpCall('kanban_get_board', params);
+  // Transform into clean output
+  var columns = (result.columns || []).map(function(col) {
+    var tasks = (col.tasks || []).map(function(t) {
+      var entry = { id: t.id, title: t.title || '(no title)' };
+      if (t.assignee) entry.assignee = t.assignee;
+      if (t.priority) entry.priority = t.priority;
+      return entry;
+    });
+    return { column: col.name, count: tasks.length, tasks: tasks };
+  });
+
+  var out = { board: {} };
+  for (var i = 0; i < columns.length; i++) {
+    out.board[columns[i].column] = columns[i].tasks;
+  }
+  if (result.tenants) out._tenants = result.tenants;
+  if (result.assignees) out._assignees = result.assignees;
+  ok(out);
+}
+
+async function cmdTasks(args) {
+  var params = {};
+  var column = flagVal(args, '--column');
+  var assignee = flagVal(args, '--assignee');
+  var board = flagVal(args, '--board');
+  if (column) params.column = column;
+  if (assignee) params.assignee = assignee;
+  if (board) params.board = board;
+
+  var result = await mcpCall('kanban_list_tasks', params);
+  var tasks = (result.tasks || []).map(function(t) {
+    var entry = { id: t.id, title: t.title || '(no title)', status: t.status || '?' };
+    if (t.assignee) entry.assignee = t.assignee;
+    if (t.priority) entry.priority = t.priority;
+    return entry;
+  });
+  ok({ count: result.count, tasks: tasks });
+}
+
+async function cmdTask(args) {
+  var taskId = args[1];
+  if (!taskId) die('missing task ID');
+  var params = { task_id: taskId };
+  var board = flagVal(args, '--board');
+  if (board) params.board = board;
+
+  var result = await mcpCall('kanban_get_task', params);
+  var task = result.task || {};
+
+  var out = {
+    task: {
+      id: task.id,
+      title: task.title,
+      status: task.status,
+    }
+  };
+  if (task.assignee) out.task.assignee = task.assignee;
+  if (task.priority != null) out.task.priority = task.priority;
+  if (task.body) out.task.body = task.body;
+  if (task.block_reason) out.task.block_reason = task.block_reason;
+  if (task.result) out.task.result = task.result;
+  if (task.summary) out.task.summary = task.summary;
+  if (Array.isArray(result.comments)) out._comments = result.comments.length;
+  if (Array.isArray(result.events)) out._events = result.events.length;
+  if (Array.isArray(result.attachments)) out._attachments = result.attachments.length;
+  if (result.links != null) out._links = Array.isArray(result.links) ? result.links.length : result.links;
+  if (Array.isArray(result.runs)) out._runs = result.runs.length;
+  ok(out);
+}
+
+async function cmdCreate(args) {
+  var title = args[1];
+  if (!title) die('missing title');
+  var params = { title: title };
+  var body = flagVal(args, '--body');
+  var assignee = flagVal(args, '--assignee');
+  var priority = flagVal(args, '--priority');
+  var board = flagVal(args, '--board');
+  if (body) params.body = body;
+  if (assignee) params.assignee = assignee;
+  if (priority != null) params.priority = parseInt(priority, 10);
+  if (hasFlag(args, '--triage')) params.triage = true;
+  if (board) params.board = board;
+
+  var result = await mcpCall('kanban_create_task', params);
+  var t = result.task || {};
+  var out = {
+    id: t.id,
+    title: t.title,
+    status: t.status || '?',
+  };
+  if (t.assignee) out.assignee = t.assignee;
+  if (t.priority != null) out.priority = t.priority;
+  if (result.warning) out._warning = result.warning;
+  ok({ created: out });
+}
+
+async function cmdUpdate(args) {
+  var taskId = args[1];
+  if (!taskId) die('missing task ID');
+  var params = { task_id: taskId };
+  var status = flagVal(args, '--status');
+  var assignee = flagVal(args, '--assignee');
+  var title = flagVal(args, '--title');
+  var body = flagVal(args, '--body');
+  var priority = flagVal(args, '--priority');
+  var board = flagVal(args, '--board');
+  var blockReason = flagVal(args, '--block-reason');
+  var resultVal = flagVal(args, '--result');
+  var summary = flagVal(args, '--summary');
+  if (status) params.status = status;
+  if (assignee) params.assignee = assignee;
+  if (title) params.title = title;
+  if (body) params.body = body;
+  if (priority != null) params.priority = parseInt(priority, 10);
+  if (board) params.board = board;
+  if (blockReason) params.block_reason = blockReason;
+  if (resultVal) params.result = resultVal;
+  if (summary) params.summary = summary;
+
+  var result = await mcpCall('kanban_update_task', params);
+  var t = result.task || {};
+  var out = {
+    id: t.id,
+    title: t.title,
+    status: t.status || '?',
+  };
+  if (t.assignee) out.assignee = t.assignee;
+  if (t.priority != null) out.priority = t.priority;
+  ok({ updated: out });
+}
+
+async function cmdDelete(args) {
+  var taskId = args[1];
+  if (!taskId) die('missing task ID');
+  var params = { task_id: taskId };
+  var board = flagVal(args, '--board');
+  if (board) params.board = board;
+
+  var result = await mcpCall('kanban_delete_task', params);
+  ok({ deleted: result.task_id });
+}
+
+async function cmdBoards() {
+  var result = await mcpCall('kanban_list_boards', {});
+  var boards = result.boards || [];
+  var out = { boards: boards };
+  if (result.default) out._default = result.default;
+  ok(out);
+}
+
+async function cmdStatus() {
+  try {
+    var result = await mcpCall('kanban_list_boards', {});
+    ok({ status: 'ok', boards: (result.boards || []).length, url: KANBAN_URL });
+  } catch (e) {
+    ok({ status: 'error', error: e.message, url: KANBAN_URL });
+    process.exit(1);
+  }
+}
+
+// ── CLI routing ─────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+if (!cmd) {
+  console.log('kanban-axi <command> [options]');
+  console.log('');
+  console.log('Commands:');
+  console.log('  board    [--board slug]                           Get board state');
+  console.log('  tasks    [--column col] [--assignee name] [--board slug]  List tasks');
+  console.log('  task     <task-id> [--board slug]                 Get task detail');
+  console.log('  create   <title> [--body ...] [--assignee ...] [--priority N] [--triage] [--board slug]');
+  console.log('                                                      Create task');
+  console.log('  update   <task-id> [--status ...] [--assignee ...] [--title ...] [--body ...]');
+  console.log('                      [--priority N] [--block-reason ...] [--result ...] [--summary ...]');
+  console.log('                                                      Update task');
+  console.log('  delete   <task-id> [--board slug]                 Delete task');
+  console.log('  boards                                             List boards');
+  console.log('  status                                             Health check');
+  console.log('');
+  console.log('Env: KANBAN_AXI_URL, KANBAN_AXI_TOKEN');
+  process.exit(0);
+}
+
+(async function main() {
+  try {
+    switch (cmd) {
+      case 'board':
+        await cmdBoard(args);
+        break;
+      case 'tasks':
+        await cmdTasks(args);
+        break;
+      case 'task':
+        await cmdTask(args);
+        break;
+      case 'create':
+        await cmdCreate(args);
+        break;
+      case 'update':
+        await cmdUpdate(args);
+        break;
+      case 'delete':
+        await cmdDelete(args);
+        break;
+      case 'boards':
+        await cmdBoards();
+        break;
+      case 'status':
+        await cmdStatus();
+        break;
+      default:
+        die('unknown command: ' + cmd);
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();

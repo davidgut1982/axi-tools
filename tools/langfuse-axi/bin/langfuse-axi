@@ -1,0 +1,290 @@
+#!/usr/bin/env node
+// langfuse-axi — CLI for Langfuse observability API
+// Token-efficient TOON output. Agent-friendly.
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+const BASE_URL_ENV = process.env.LANGFUSE_AXI_URL || 'http://192.168.1.33:3000';
+const BASE = new URL(BASE_URL_ENV);
+const PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
+const HOSTNAME = BASE.hostname;
+const PORT = parseInt(BASE.port, 10) || (PROTOCOL === 'https' ? 443 : 80);
+const LANGFUSE_PK = process.env.LANGFUSE_AXI_PK || 'pk-lf-c97c5431f1d367e04dc438b6f1b1e8ed';
+const LANGFUSE_SK = process.env.LANGFUSE_AXI_SK || 'sk-lf-0bde83196c54ca5fb0d53d3bc9ab984eef92734dd58ba8d1';
+const AUTH = 'Basic ' + Buffer.from(LANGFUSE_PK + ':' + LANGFUSE_SK).toString('base64');
+
+function apiFetch(path, opts) {
+  opts = opts || {};
+  var method = opts.method || 'GET';
+  var transport = PROTOCOL === 'https' ? https : http;
+
+  var options = {
+    hostname: HOSTNAME,
+    port: PORT,
+    path: path,
+    method: method,
+    headers: {
+      'Host': 'localhost:3000',
+      'Authorization': AUTH,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+  };
+
+  if (opts.body) {
+    var bodyStr = JSON.stringify(opts.body);
+    options.headers['Content-Length'] = Buffer.byteLength(bodyStr);
+  }
+
+  return new Promise(function(resolve, reject) {
+    var req = transport.request(options, function(res) {
+      var body = '';
+      res.on('data', function(chunk) { body += chunk; });
+      res.on('end', function() {
+        var data;
+        try { data = JSON.parse(body); } catch (_) { data = body; }
+        resolve({ status: res.statusCode, data: data });
+      });
+    });
+    req.on('error', reject);
+    if (opts.body) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      // Quote if there are leading/trailing spaces or the string contains
+      // chars that would break YAML parsing
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') {
+        return JSON.stringify(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          // strip leading newline + 2 spaces from first-level object keys
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          // multi-line value — key on its own line, then indented content
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function ok(dataObj) {
+  console.log(toon({ ok: true, env: BASE_URL_ENV.includes('localhost') ? 'dev' : 'production', data: dataObj }));
+}
+
+// ── API methods ─────────────────────────────────────
+
+async function listTraces(limit) {
+  var resp = await apiFetch('/api/public/traces?limit=' + (limit || 5));
+  if (resp.status !== 200) die('langfuse returned HTTP ' + resp.status + ': ' + JSON.stringify(resp.data));
+  var traces = (resp.data.data || []).map(function(t) {
+    return {
+      id: t.id,
+      name: t.name || '',
+      timestamp: t.timestamp,
+      userId: t.userId || '',
+      latency: t.latency,
+      totalCost: t.totalCost || 0,
+      _observations: (t.observations || []).length,
+    };
+  });
+  ok({ traces: traces });
+}
+
+async function getTrace(traceId) {
+  var resp = await apiFetch('/api/public/traces/' + traceId);
+  if (resp.status !== 200) die('langfuse returned HTTP ' + resp.status + ': ' + JSON.stringify(resp.data));
+  var t = resp.data;
+  var observations = (t.observations || []).map(function(o) {
+    return {
+      id: o.id,
+      name: o.name || null,
+      type: o.type,
+      startTime: o.startTime || null,
+      latency: o.latency,
+      model: o.model || null,
+      input: o.input,
+      output: o.output,
+      usage: o.usage,
+      level: o.level,
+    };
+  });
+  ok({
+    id: t.id,
+    name: t.name,
+    timestamp: t.timestamp,
+    userId: t.userId,
+    metadata: t.metadata,
+    totalCost: t.totalCost,
+    latency: t.latency,
+    input: t.input,
+    output: t.output,
+    observations: observations,
+  });
+}
+
+async function listPrompts(limit) {
+  var resp = await apiFetch('/api/public/v2/prompts?limit=' + (limit || 10));
+  if (resp.status !== 200) die('langfuse returned HTTP ' + resp.status + ': ' + JSON.stringify(resp.data));
+  var prompts = (resp.data.data || []).map(function(p) {
+    return {
+      name: p.name,
+      version: p.version,
+      type: p.type,
+      _promptPreview: (p.prompt || '').slice(0, 80).replace(/\n/g, ' '),
+    };
+  });
+  ok({ prompts: prompts });
+}
+
+async function getPrompt(promptName) {
+  var resp = await apiFetch('/api/public/v2/prompts/' + encodeURIComponent(promptName));
+  if (resp.status !== 200) die('langfuse returned HTTP ' + resp.status + ': ' + JSON.stringify(resp.data));
+  ok({
+    name: resp.data.name,
+    version: resp.data.version,
+    type: resp.data.type,
+    prompt: resp.data.prompt,
+    config: resp.data.config || {},
+  });
+}
+
+async function checkStatus() {
+  var resp = await apiFetch('/api/public/health');
+  ok({
+    _status: resp.status,
+    version: resp.data.version || 'unknown',
+    status: resp.data.status || (resp.status === 200 ? 'ok' : 'degraded'),
+  });
+}
+
+async function listSessions(limit) {
+  var resp = await apiFetch('/api/public/sessions?limit=' + (limit || 5));
+  if (resp.status !== 200) die('langfuse returned HTTP ' + resp.status + ': ' + JSON.stringify(resp.data));
+  var sessions = (resp.data.data || []).map(function(s) {
+    return {
+      id: s.id,
+      createdAt: s.createdAt,
+      _traces: (s.traces || []).length,
+      _users: (s.userIds || []).join(', '),
+    };
+  });
+  ok({ sessions: sessions });
+}
+
+// ── CLI routing ─────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+function flagVal(flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+if (!cmd) {
+  console.log('langfuse-axi <command> [options]');
+  console.log('');
+  console.log('Commands:');
+  console.log('  traces [--limit N]        List recent traces');
+  console.log('  trace <trace-id>          Get trace detail');
+  console.log('  prompts [--limit N]       List prompts');
+  console.log('  prompt <prompt-name>      Get prompt detail');
+  console.log('  status                    Health check');
+  console.log('  sessions [--limit N]      List sessions');
+  console.log('');
+  console.log('Env: LANGFUSE_AXI_URL, LANGFUSE_AXI_PK, LANGFUSE_AXI_SK');
+  process.exit(0);
+}
+
+(async function main() {
+  try {
+    switch (cmd) {
+      case 'traces': {
+        var limit = parseInt(flagVal('--limit'), 10) || 5;
+        await listTraces(limit);
+        break;
+      }
+      case 'trace': {
+        var id = args[1];
+        if (!id) die('missing trace ID');
+        await getTrace(id);
+        break;
+      }
+      case 'prompts': {
+        var limit = parseInt(flagVal('--limit'), 10) || 10;
+        await listPrompts(limit);
+        break;
+      }
+      case 'prompt': {
+        var name = args[1];
+        if (!name) die('missing prompt name');
+        await getPrompt(name);
+        break;
+      }
+      case 'status':
+        await checkStatus();
+        break;
+      case 'sessions': {
+        var limit = parseInt(flagVal('--limit'), 10) || 5;
+        await listSessions(limit);
+        break;
+      }
+      default:
+        die('unknown command: ' + cmd);
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();

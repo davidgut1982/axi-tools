@@ -1,0 +1,107 @@
+{
+  "tools": [
+    {
+      "name": "cluster-ops-axi",
+      "version": "1.0.0",
+      "description": "Proxmox cluster operations (containers, disk, services, journal)",
+      "runtime": "Node.js (http module only)",
+      "path": "tools/cluster-ops-axi",
+      "env": {
+        "CLUSTER_OPS_AXI_URL": "URL of the cluster-ops API endpoint"
+      },
+      "commands": ["status", "containers", "disk", "services", "journal"],
+      "has_plugin": false,
+      "has_skill": true
+    },
+    {
+      "name": "lore-axi",
+      "version": "1.0.0",
+      "description": "Knowledge base, journal, investigations, search",
+      "runtime": "Node.js",
+      "path": "tools/lore-axi",
+      "env": {
+        "LORE_MCP_URL": "URL of the lore MCP knowledge server (default: http://192.168.1.21:5555/mcp)"
+      },
+      "commands": ["kb-search", "kb-get", "kb-list", "jrnl-today", "jrnl-search", "inv-list", "search-local"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "langfuse-axi",
+      "version": "1.0.0",
+      "description": "LLM observability (traces, prompts, sessions)",
+      "runtime": "Node.js",
+      "path": "tools/langfuse-axi",
+      "env": {
+        "LANGFUSE_AXI_URL": "Langfuse API base URL",
+        "LANGFUSE_AXI_PK": "Langfuse public key",
+        "LANGFUSE_AXI_SK": "Langfuse secret key"
+      },
+      "commands": ["traces", "trace", "prompts", "prompt", "status", "sessions"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "kanban-axi",
+      "version": "1.0.0",
+      "description": "Project boards and task tracking",
+      "runtime": "Node.js",
+      "path": "tools/kanban-axi",
+      "env": {
+        "KANBAN_AXI_URL": "Kanban API base URL",
+        "KANBAN_AXI_TOKEN": "Kanban API authentication token"
+      },
+      "commands": ["board", "tasks", "task", "create", "update", "delete", "boards", "status"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "vector-indexer-axi",
+      "version": "1.0.0",
+      "description": "Codebase semantic/lexical search (105K files, 694K chunks)",
+      "runtime": "Node.js",
+      "path": "tools/vector-indexer-axi",
+      "env": {
+        "VECTOR_INDEXER_AXI_URL": "URL of the vector-indexer API endpoint"
+      },
+      "commands": ["search", "semantic", "hybrid", "chunks", "status", "reindex"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "codeintel-axi",
+      "version": "1.0.0",
+      "description": "LSP-based code intelligence (symbols, callers, callees, references)",
+      "runtime": "Node.js (spawns Python subprocess)",
+      "path": "tools/codeintel-axi",
+      "env": {
+        "CODEINTEL_AXI_CMD": "Override server command (default: .venv/bin/python -m codeintel_router.server)"
+      },
+      "commands": ["symbols", "callers", "callees", "search", "references", "index-repo", "index-status"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "gh-axi",
+      "version": "1.0.0",
+      "description": "GitHub operations (issues, PRs, workflow runs, releases)",
+      "runtime": "Node.js",
+      "path": "tools/gh-axi",
+      "env": {},
+      "commands": ["issue", "pr", "run", "release", "repo", "label"],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "npm-axi",
+      "version": "1.0.0",
+      "description": "npm registry search and package inspection",
+      "runtime": "Node.js",
+      "path": "tools/npm-axi",
+      "env": {},
+      "commands": ["search", "view", "versions", "downloads"],
+      "has_plugin": true,
+      "has_skill": false
+    }
+  ]
+}

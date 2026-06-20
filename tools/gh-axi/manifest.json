@@ -1,0 +1,16 @@
+{
+  "name": "gh-axi",
+  "version": "1.0.0",
+  "description": "GitHub operations — issues, PRs, workflow runs, releases",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "commands": [
+    {"name": "issue", "desc": "Issue commands: view, list, create", "args": ["<subcommand>"]},
+    {"name": "pr", "desc": "PR commands: view, list, create", "args": ["<subcommand>"]},
+    {"name": "run", "desc": "Workflow run commands: view, list", "args": ["<subcommand>"]},
+    {"name": "release", "desc": "Release commands: view, list", "args": ["<subcommand>"]},
+    {"name": "repo", "desc": "Repo commands: view", "args": ["<subcommand>"]},
+    {"name": "label", "desc": "Label commands: list", "args": ["<subcommand>"]}
+  ],
+  "plugin": "plugin/axi-gh-axi.js"
+}

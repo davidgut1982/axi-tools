@@ -1,0 +1,416 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawn } = require('child_process');
+const path = require('path');
+
+// ── Configuration ──────────────────────────────────────────────────
+const DEFAULT_PYTHON = '/home/david/codeintel-stack/router/.venv/bin/python';
+const DEFAULT_ARGS   = ['-m', 'codeintel_router.server'];
+const TIMEOUT_MS     = 30_000;
+
+function getServerCmd() {
+  const env = process.env.CODEINTEL_AXI_CMD;
+  if (env) {
+    const parts = env.trim().split(/\s+/);
+    return { cmd: parts[0], args: parts.slice(1) };
+  }
+  return { cmd: DEFAULT_PYTHON, args: DEFAULT_ARGS };
+}
+
+// ── TOON Output helpers ────────────────────────────────────────────
+
+/** Right-pad a value to the given width (monospace-safe). */
+function pad(val, width) {
+  const s = String(val == null ? '' : val);
+  return s + ' '.repeat(Math.max(0, width - s.length));
+}
+
+/** Print a columnar table with uppercase headers + a row count footer. */
+function table(headers, rows) {
+  const widths = headers.map((h, i) => {
+    const maxRow = rows.reduce((m, r) => Math.max(m, String(r[i] ?? '').length), 0);
+    return Math.max(h.length, maxRow, 3);
+  });
+
+  // Header
+  const hdr = headers.map((h, i) => pad(h, widths[i]).toUpperCase()).join('  ');
+  console.log(hdr);
+  console.log('─'.repeat(hdr.length));
+
+  // Rows
+  for (const row of rows) {
+    console.log(row.map((c, i) => pad(c ?? '', widths[i])).join('  '));
+  }
+
+  console.log(`\n${rows.length} result${rows.length === 1 ? '' : 's'}`);
+}
+
+// ── MCP stdio client ───────────────────────────────────────────────
+
+function createClient() {
+  const { cmd, args } = getServerCmd();
+
+  const proc = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+  let nextId   = 2;                 // 1 = initialize
+  let buf      = '';
+  let pending  = new Map();          // id → resolve
+
+  proc.on('error', (err) => {
+    for (const [, reject] of pending) reject(err);
+    pending.clear();
+  });
+
+  // swallow stderr
+  proc.stderr.resume();
+
+  proc.stdout.on('data', (chunk) => {
+    buf += chunk.toString();
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';        // partial line stays in buffer
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (typeof msg.id === 'number' && pending.has(msg.id)) {
+          const resolve = pending.get(msg.id);
+          pending.delete(msg.id);
+          resolve(msg);
+        }
+      } catch { /* skip non-JSON lines */ }
+    }
+  });
+
+  /** Send a JSON-RPC request; returns the result (or rejects on error). */
+  function request(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = nextId++;
+      const payload = { jsonrpc: '2.0', id, method, params };
+
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`Timeout after ${TIMEOUT_MS}ms: ${method}`));
+      }, TIMEOUT_MS);
+
+      pending.set(id, (resp) => {
+        clearTimeout(timer);
+        if (resp.error) {
+          const msg = resp.error.message || resp.error.data || JSON.stringify(resp.error);
+          reject(new Error(`MCP error: ${msg}`));
+        } else {
+          resolve(resp.result);
+        }
+      });
+
+      proc.stdin.write(JSON.stringify(payload) + '\n');
+    });
+  }
+
+  /** Send a notification (no id — server doesn't reply). */
+  function notify(method, params) {
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+  }
+
+  /** Full MCP handshake: initialize → send initialized notification. */
+  async function initialize() {
+    const result = await request('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities:    {},
+      clientInfo:      { name: 'codeintel-axi', version: '0.1.0' },
+    });
+    notify('notifications/initialized', {});
+    return result;
+  }
+
+  /** Call a server tool by name, returning the raw result object. */
+  async function callTool(name, args = {}) {
+    return request('tools/call', { name, arguments: args });
+  }
+
+  /** Kill the server process. */
+  function close() {
+    if (!proc.killed) proc.kill();
+  }
+
+  return { initialize, callTool, close };
+}
+
+// ── Content extraction ─────────────────────────────────────────────
+
+/** Concatenate all text-type content blocks from an MCP result. */
+function extractText(result) {
+  if (!result || !Array.isArray(result.content)) return '';
+  return result.content
+    .filter((c) => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n');
+}
+
+/** Try to JSON-parse a string; fall back to the raw string. */
+function tryJSON(raw) {
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
+// ── Display helpers ─────────────────────────────────────────────────
+
+function displayCallGraph(text, symbol, filePath, label) {
+  console.log(`${label} of ${symbol}  (${filePath})`);
+  console.log('─'.repeat(60));
+
+  const data = tryJSON(text);
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const name = item.symbol || item.name || item.caller || item.callee || '?';
+      const loc  = (item.file || item.path || item.location || '')
+        + (item.line ? `:${item.line}` : '');
+      console.log(`  → ${name}  ${loc}`);
+    }
+    console.log(`\n${data.length} ${label.toLowerCase()} found`);
+  } else if (typeof data === 'object' && data !== null) {
+    // Try common nested shapes: data.callers, data.callees, data.results
+    const arr = data.callers || data.callees || data.results || [];
+    if (Array.isArray(arr) && arr.length) {
+      for (const item of arr) {
+        const name = item.symbol || item.name || item.caller || item.callee || '?';
+        const loc  = (item.file || item.path || '') + (item.line ? `:${item.line}` : '');
+        console.log(`  → ${name}  ${loc}`);
+      }
+      console.log(`\n${arr.length} ${label.toLowerCase()} found`);
+    } else {
+      console.log(text);
+    }
+  } else {
+    console.log(text);
+  }
+}
+
+// ── Command implementations ────────────────────────────────────────
+
+async function cmdSymbols(client, query) {
+  const result = await client.callTool('symbols', { query });
+  const text   = extractText(result);
+  const data   = tryJSON(text);
+
+  if (Array.isArray(data)) {
+    const rows = data.map((it) => [
+      it.name || it.symbol || '',
+      it.path || it.file || '',
+      it.line ?? '',
+    ]);
+    table(['SYMBOL', 'FILE', 'LINE'], rows);
+  } else {
+    console.log(text);
+  }
+}
+
+async function cmdCallGraph(client, symbol, filePath, direction) {
+  const result = await client.callTool('call_graph', {
+    symbol,
+    path: filePath,
+    direction,
+  });
+  const text = extractText(result);
+  const label = direction === 'callers' ? 'CALLERS' : direction === 'callees' ? 'CALLEES' : direction.toUpperCase();
+  displayCallGraph(text, symbol, filePath, label);
+}
+
+async function cmdSearch(client, query, opts) {
+  const args = { query };
+  if (opts.limit) args.limit = Number(opts.limit);
+  if (opts.repo)  args.repo  = opts.repo;
+
+  const result = await client.callTool('code_search', args);
+  const text   = extractText(result);
+  const data   = tryJSON(text);
+
+  if (Array.isArray(data)) {
+    const rows = data.map((it) => [
+      it.symbol ?? '',
+      it.file || it.path || '',
+      it.line ?? '',
+      (it.snippet || '').substring(0, 80),
+    ]);
+    table(['SYMBOL', 'FILE', 'LINE', 'SNIPPET'], rows);
+  } else {
+    console.log(text);
+  }
+}
+
+async function cmdReferences(client, symbol, filePath, opts) {
+  const args = { symbol, path: filePath };
+  if (opts.limit) args.limit = Number(opts.limit);
+  if (opts.repo)  args.repo  = opts.repo;
+
+  const result = await client.callTool('find_references', args);
+  const text   = extractText(result);
+  const data   = tryJSON(text);
+
+  if (Array.isArray(data)) {
+    const rows = data.map((it) => [
+      it.file || it.path || '',
+      it.line ?? '',
+      (it.snippet || it.context || it.text || '').substring(0, 80),
+    ]);
+    table(['FILE', 'LINE', 'CONTEXT'], rows);
+  } else {
+    console.log(text);
+  }
+}
+
+async function cmdIndexRepo(client, repoPath) {
+  const result = await client.callTool('index_repo', { repo: repoPath });
+  const text   = extractText(result);
+  console.log(text || `Indexing triggered for ${repoPath}`);
+}
+
+async function cmdIndexStatus(client, repoPath) {
+  const args = {};
+  if (repoPath) args.repo = repoPath;
+
+  const result = await client.callTool('index_status', args);
+  const text   = extractText(result);
+  console.log(text);
+}
+
+// ── Argument parsing ───────────────────────────────────────────────
+
+function parseOpts(argv) {
+  const opts = {};
+  const positional = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--path' && i + 1 < argv.length) {
+      opts.path = argv[++i];
+    } else if (arg === '--limit' && i + 1 < argv.length) {
+      opts.limit = argv[++i];
+    } else if (arg === '--repo' && i + 1 < argv.length) {
+      opts.repo = argv[++i];
+    } else if (arg === '--max-depth' && i + 1 < argv.length) {
+      opts.maxDepth = Number(argv[++i]);
+    } else if (!arg.startsWith('-')) {
+      positional.push(arg);
+    }
+  }
+
+  opts._ = positional;
+  return opts;
+}
+
+function usage() {
+  console.log(`codeintel-axi — code intelligence (codescout LSP)
+
+USAGE
+  codeintel-axi <command> [options]
+
+COMMANDS
+  symbols <query>                      Find symbols by name (fuzzy)
+  callers <symbol> --path <file>       Get callers of a symbol
+  callees <symbol> --path <file>       Get callees of a symbol
+  search <query> [--limit N]           FTS5 keyword code search
+           [--repo <path>]
+  references <symbol> --path <file>    Find all references / usages
+           [--limit N] [--repo <path>]
+  index-repo <path>                    Trigger (re)indexing of a repo
+  index-status [--repo <path>]         Index status (all repos if omitted)
+
+ENV
+  CODEINTEL_AXI_CMD    Override server command
+                       (default: .venv/bin/python -m codeintel_router.server)
+
+EXAMPLES
+  codeintel-axi symbols AuthService
+  codeintel-axi callers handleLogin --path src/auth/login.ts
+  codeintel-axi search "Bearer token" --limit 20
+  codeintel-axi references getSession --path src/auth/session.ts
+  codeintel-axi index-repo /home/david/my-project
+  codeintel-axi index-status --repo /home/david/my-project`);
+}
+
+// ── Main ───────────────────────────────────────────────────────────
+
+async function main() {
+  const argv = process.argv.slice(2);
+
+  if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
+    usage();
+    return;
+  }
+
+  const command = argv[0];
+  const rest    = argv.slice(1);
+  const VALID   = new Set(['symbols','callers','callees','search','references','index-repo','index-status']);
+
+  if (!VALID.has(command)) {
+    console.error(`ERROR: Unknown command '${command}'`);
+    console.error("Run 'codeintel-axi --help' for usage");
+    process.exit(1);
+  }
+
+  let client;
+  let code = 0;
+
+  try {
+    client = createClient();
+    await client.initialize();
+
+    const opts = parseOpts(rest);
+    const pos  = opts._;   // positional args
+
+    switch (command) {
+      case 'symbols': {
+        const q = pos.join(' ');
+        if (!q) throw new Error("'symbols' requires a query");
+        await cmdSymbols(client, q);
+        break;
+      }
+      case 'callers': {
+        const sym = pos[0];
+        if (!sym)  throw new Error("'callers' requires a symbol");
+        if (!opts.path) throw new Error("'callers' requires --path <file>");
+        await cmdCallGraph(client, sym, opts.path, 'callers');
+        break;
+      }
+      case 'callees': {
+        const sym = pos[0];
+        if (!sym)  throw new Error("'callees' requires a symbol");
+        if (!opts.path) throw new Error("'callees' requires --path <file>");
+        await cmdCallGraph(client, sym, opts.path, 'callees');
+        break;
+      }
+      case 'search': {
+        const q = pos.join(' ');
+        if (!q) throw new Error("'search' requires a query");
+        await cmdSearch(client, q, opts);
+        break;
+      }
+      case 'references': {
+        const sym = pos[0];
+        if (!sym)  throw new Error("'references' requires a symbol");
+        if (!opts.path) throw new Error("'references' requires --path <file>");
+        await cmdReferences(client, sym, opts.path, opts);
+        break;
+      }
+      case 'index-repo': {
+        const repo = pos[0];
+        if (!repo) throw new Error("'index-repo' requires a repository path");
+        await cmdIndexRepo(client, repo);
+        break;
+      }
+      case 'index-status': {
+        await cmdIndexStatus(client, opts.repo || null);
+        break;
+      }
+    }
+  } catch (err) {
+    console.error('ERROR:', err.message);
+    code = 1;
+  } finally {
+    if (client) client.close();
+  }
+
+  process.exit(code);
+}
+
+main();

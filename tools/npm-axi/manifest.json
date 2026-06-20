@@ -1,0 +1,14 @@
+{
+  "name": "npm-axi",
+  "version": "1.0.0",
+  "description": "npm registry search and package inspection",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "commands": [
+    {"name": "search", "desc": "Search packages", "args": ["<query>"]},
+    {"name": "view", "desc": "Package details", "args": ["<package>"]},
+    {"name": "versions", "desc": "Recent versions", "args": ["<package>"]},
+    {"name": "downloads", "desc": "Download stats", "args": ["<package>"]}
+  ],
+  "plugin": "plugin/axi-npm-axi.js"
+}

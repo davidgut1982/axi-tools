@@ -1,0 +1,20 @@
+{
+  "name": "codeintel-axi",
+  "version": "1.0.0",
+  "description": "LSP-based code intelligence — symbols, callers, callees, references",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "CODEINTEL_AXI_CMD": ".venv/bin/python -m codeintel_router.server"
+  },
+  "commands": [
+    {"name": "symbols", "desc": "Find symbols by name", "args": ["<query>"]},
+    {"name": "callers", "desc": "Get callers", "args": ["<symbol>", "--path"]},
+    {"name": "callees", "desc": "Get callees", "args": ["<symbol>", "--path"]},
+    {"name": "search", "desc": "FTS5 code search", "args": ["<query>", "--limit"]},
+    {"name": "references", "desc": "Find references", "args": ["<symbol>", "--path", "--limit"]},
+    {"name": "index-repo", "desc": "Trigger reindexing", "args": ["<path>"]},
+    {"name": "index-status", "desc": "Index status", "args": ["--repo"]}
+  ],
+  "plugin": "plugin/axi-codeintel-axi.js"
+}

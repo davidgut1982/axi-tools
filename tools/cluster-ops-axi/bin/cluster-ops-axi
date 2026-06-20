@@ -1,0 +1,271 @@
+#!/usr/bin/env node
+"use strict";
+/**
+ * cluster-ops-axi — AXI-compliant CLI for Proxmox cluster operations
+ *
+ * 10 AXI Principles applied:
+ * 1. TOON format output (~40% token savings over JSON)
+ * 2. Minimal default schemas (3-4 key fields)
+ * 3. Content truncation with --full escape hatch
+ * 4. Pre-computed aggregates (counts, summaries)
+ * 5. Definitive empty states (explicit "0 results")
+ * 6. Structured errors & exit codes
+ * 7. Ambient context via session hooks
+ * 8. Content first (no args = dashboard)
+ * 9. Contextual disclosure (next-step suggestions)
+ * 10. Consistent --help on every subcommand
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+const commander_1 = require("commander");
+const client_js_1 = require("./client.js");
+const program = new commander_1.Command();
+program
+    .name('cluster-ops-axi')
+    .description('AXI-compliant CLI for Proxmox cluster operations')
+    .version('0.2.0')
+    .option('--full', 'Show full output without truncation')
+    .option('--json', 'Output raw JSON instead of TOON format');
+// ─── Dashboard (content-first: no args = live data) ───
+program
+    .command('dashboard')
+    .description('Show live cluster snapshot — hosts, containers, disk warnings, failed services')
+    .argument('[groups...]', 'Filter by group name (hypervisors, databases, etc.)')
+    .option('-g, --groups <groups...>', 'Filter by group name (alternative syntax)')
+    .action(async (groups, opts) => {
+    try {
+        const filter = groups.length > 0 ? groups : (opts.groups || undefined);
+        const data = await client_js_1.client.clusterSnapshot(filter);
+        if (opts.parent?.json) {
+            console.log(JSON.stringify(data, null, 2));
+            return;
+        }
+        const total = data?.hosts?.length || 0;
+        const reachable = data?.summary?.reachable || 0;
+        const errored = data?.summary?.errored || 0;
+        const full = opts.parent?.full;
+        const lines = [`cluster: ${data?.host_count || total} hosts`];
+        lines.push(`reachable: ${reachable}  errored: ${errored}`);
+        if (data?.hosts?.length) {
+            lines.push('hosts: [');
+            for (const h of data.hosts.slice(0, full ? undefined : 20)) {
+                const warn = h.disk_warn?.length ? ` ⚠${h.disk_warn.length}` : '';
+                const fail = h.failed_services?.length ? ` ✗${h.failed_services.length}` : '';
+                const containers = h.containers?.length || 0;
+                lines.push(`  { host: "${h.host}" containers: ${containers}${warn}${fail} }`);
+            }
+            if (!full && data.hosts.length > 20) {
+                lines.push(`  ... ${data.hosts.length - 20} more (use --full)`);
+            }
+            lines.push(']');
+        }
+        lines.push('help: "cluster-ops-axi host <name>" to drill into a host');
+        lines.push('help: "cluster-ops-axi dashboard -g hypervisors" to filter');
+        console.log(lines.join('\n'));
+    }
+    catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+});
+// ─── Host drill-down ───
+program
+    .command('host')
+    .description('Show containers and disk usage for a specific host')
+    .argument('<host>', 'Host alias from cluster.yaml')
+    .action(async (host, opts) => {
+    try {
+        const [psResult, diskResult] = await Promise.allSettled([
+            client_js_1.client.dockerPs(host),
+            client_js_1.client.diskUsage(host),
+        ]);
+        if (opts.parent?.json) {
+            const out = { host };
+            if (psResult.status === 'fulfilled')
+                out.containers = psResult.value;
+            if (diskResult.status === 'fulfilled')
+                out.disks = diskResult.value;
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+        const full = opts.parent?.full;
+        console.log(`host: ${host}`);
+        // Docker containers
+        if (psResult.status === 'fulfilled') {
+            const containers = psResult.value?.containers || [];
+            console.log(`containers: ${containers.length}`);
+            if (containers.length > 0) {
+                console.log('items: [');
+                for (const c of containers.slice(0, full ? undefined : 30)) {
+                    const state = c.state === 'running' ? '▶' : '⏹';
+                    const health = c.health === 'healthy' ? '✓' : c.health ? `?${c.health}` : '';
+                    const mem = c.mem_mb ? `${c.mem_mb}MB` : '';
+                    console.log(`  { name: "${c.name}" ${state} ${health} ${mem} }`);
+                }
+                console.log(']');
+            }
+        }
+        else {
+            console.log(`containers: error (${psResult.reason.message})`);
+        }
+        // Disk usage
+        if (diskResult.status === 'fulfilled') {
+            const filesystems = diskResult.value?.filesystems || [];
+            console.log(`disks: ${filesystems.length}`);
+            for (const fs of filesystems) {
+                const pct = fs.use_pct !== undefined ? `${fs.use_pct}%` : '';
+                const warn = (fs.use_pct || 0) > 80 ? ' ⚠' : '';
+                console.log(`  { mount: "${fs.mount}" ${fs.total_gb}GB ${pct}${warn} }`);
+            }
+        }
+        else {
+            console.log(`disks: error (${diskResult.reason.message})`);
+        }
+        console.log(`help: "cluster-ops-axi service ${host} <unit>" to check a service`);
+        console.log(`help: "cluster-ops-axi journal ${host} <unit>" to see logs`);
+        console.log(`help: "cluster-ops-axi exec ${host} <command>" to run a command`);
+    }
+    catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+});
+// ─── Service status ───
+program
+    .command('service')
+    .description('Check systemd service status on a host')
+    .argument('<host>', 'Host alias')
+    .argument('<unit>', 'systemd unit name (e.g. docker.service)')
+    .action(async (host, unit, opts) => {
+    try {
+        const data = await client_js_1.client.serviceStatus(host, unit);
+        if (opts.parent?.json) {
+            console.log(JSON.stringify(data, null, 2));
+            return;
+        }
+        const status = data?.sub_state === 'running' ? '▶' : data?.active === 'active' ? '✓' : '✗';
+        console.log(`service: ${data?.unit || unit}`);
+        console.log(`status: ${status} ${data?.active || 'unknown'} (${data?.sub_state || '?'})`);
+        if (data?.pid)
+            console.log(`pid: ${data.pid}`);
+        if (data?.since)
+            console.log(`since: ${data.since}`);
+        if (data?.restarts && data.restarts > 0)
+            console.log(`restarts: ${data.restarts}`);
+        if (data?.memory_bytes)
+            console.log(`memory: ${(data.memory_bytes / 1024 / 1024).toFixed(1)}MB`);
+        console.log(`help: "cluster-ops-axi journal ${host} ${unit}" to see logs`);
+    }
+    catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+});
+// ─── Journal tail ───
+program
+    .command('journal')
+    .description('Show recent journalctl entries for a systemd unit')
+    .argument('<host>', 'Host alias')
+    .argument('<unit>', 'systemd unit name')
+    .option('-n, --lines <count>', 'Number of lines (default: 30)', '30')
+    .action(async (host, unit, opts) => {
+    try {
+        const data = await client_js_1.client.journalTail(host, unit, parseInt(opts.lines) || 30);
+        if (opts.parent?.json) {
+            console.log(JSON.stringify(data, null, 2));
+            return;
+        }
+        const entries = data?.entries || [];
+        console.log(`journal: ${data?.unit || unit} on ${host}`);
+        console.log(`entries: ${entries.length}`);
+        for (const e of entries.slice(0, 50)) {
+            const lvl = e.priority === 'error' || e.priority === 'crit' ? '✗' :
+                e.priority === 'warning' ? '⚠' : '·';
+            console.log(`  ${lvl} ${e.ts || ''} ${e.msg || ''}`);
+        }
+        console.log(`help: "cluster-ops-axi service ${host} ${unit}" for status`);
+    }
+    catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+});
+// ─── Exec raw ───
+program
+    .command('exec')
+    .description('Run a shell command on a host via SSH')
+    .argument('<host>', 'Host alias')
+    .argument('<command...>', 'Command to run')
+    .option('-t, --timeout <seconds>', 'Timeout in seconds (default: 5)', '5')
+    .action(async (host, command, opts) => {
+    try {
+        const cmd = command.join(' ');
+        const timeoutS = parseInt(opts.timeout) || 5;
+        const data = await client_js_1.client.execRaw(host, cmd, timeoutS);
+        if (opts.parent?.json) {
+            console.log(JSON.stringify(data, null, 2));
+            return;
+        }
+        console.log(`exec: ${cmd} on ${host}`);
+        if (data?.error) {
+            console.log(`error: ${data.error}`);
+            if (data.pattern)
+                console.log(`denied: ${data.pattern}`);
+            process.exit(1);
+        }
+        if (data?.stdout) {
+            const lines = data.stdout.split('\n');
+            const maxLines = opts.parent?.full ? lines.length : 50;
+            for (const line of lines.slice(0, maxLines)) {
+                console.log(`  ${line}`);
+            }
+            if (lines.length > maxLines) {
+                console.log(`  ... ${lines.length - maxLines} more lines (use --full)`);
+            }
+        }
+        if (data?.stderr && !opts.parent?.json) {
+            console.log(`stderr: ${data.stderr.split('\n').slice(0, 5).join('\n  ')}`);
+        }
+        if (data?.exit_code !== undefined)
+            console.log(`exit: ${data.exit_code}`);
+        if (data?.duration_ms !== undefined)
+            console.log(`duration: ${data.duration_ms}ms`);
+        if (data?.truncated)
+            console.log('warning: output truncated (16KB limit)');
+        console.log(`help: "cluster-ops-axi service ${host} <unit>" to check service status`);
+    }
+    catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+    }
+});
+// ─── Run ───
+async function main() {
+    const args = process.argv.slice(2);
+    // Content-first: no args = dashboard
+    if (args.length === 0) {
+        const data = await client_js_1.client.clusterSnapshot();
+        const total = data?.hosts?.length || 0;
+        const reachable = data?.summary?.reachable || 0;
+        const errored = data?.summary?.errored || 0;
+        console.log(`cluster: ${total} hosts (${reachable} reachable, ${errored} errored)`);
+        console.log('hosts: [');
+        for (const h of (data?.hosts || []).slice(0, 10)) {
+            const c = h.containers?.length || 0;
+            const warn = h.disk_warn?.length ? ` ⚠${h.disk_warn.length}` : '';
+            const fail = h.failed_services?.length ? ` ✗${h.failed_services.length}` : '';
+            console.log(`  { "${h.host}" ${c}ct${warn}${fail} }`);
+        }
+        if (total > 10)
+            console.log(`  ... ${total - 10} more (use dashboard)`);
+        console.log(']');
+        console.log('help: "cluster-ops-axi dashboard" for full view');
+        console.log('help: "cluster-ops-axi host <name>" for host details');
+        return;
+    }
+    await program.parseAsync(process.argv);
+}
+main().catch(err => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+});
+//# sourceMappingURL=index.js.map

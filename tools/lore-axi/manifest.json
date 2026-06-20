@@ -1,0 +1,22 @@
+{
+  "name": "lore-axi",
+  "version": "1.0.0",
+  "description": "Knowledge base, journal, investigations, and local search",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "LORE_MCP_URL": "http://192.168.1.21:5555/mcp"
+  },
+  "commands": [
+    {"name": "kb-search", "desc": "Knowledge base search", "args": ["<query>", "--limit"]},
+    {"name": "kb-get", "desc": "Get entry by key", "args": ["<key>"]},
+    {"name": "kb-list", "desc": "List entries", "args": ["--limit"]},
+    {"name": "kb-add", "desc": "Add entry", "args": ["<key>", "<value>"]},
+    {"name": "kb-delete", "desc": "Delete entry", "args": ["<key>"]},
+    {"name": "jrnl-today", "desc": "Today's journal entry", "args": []},
+    {"name": "jrnl-search", "desc": "Search journal", "args": ["<query>"]},
+    {"name": "inv-list", "desc": "List investigations", "args": ["--limit"]},
+    {"name": "search-local", "desc": "Local file search", "args": ["<query>"]}
+  ],
+  "plugin": "plugin/axi-lore-axi.js"
+}

@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { AxiError, installSessionStartHooks, runAxiCli } from "axi-sdk-js";
+import { COMMAND_HELP, TOP_LEVEL_HELP } from "../help.js";
+import { homeCommand } from "../home.js";
+import { kbAdd, kbSearch, kbGet, kbList, kbUpdate, kbDelete, kbIngestDoc, kbIngestDir, kbSync, kbEmbeddings, kbEmbeddingStatus, } from "../commands/kb.js";
+import { invAdd, invList, invGet, invLogExp, invDeleteNote, invDeleteExp, invListExp, } from "../commands/investigation.js";
+import { journalAppend, journalList, journalGet, journalSearch, journalDelete, } from "../commands/journal.js";
+import { mcpScan, mcpSearch, mcpGetServer, mcpGetTool, mcpRebuild, } from "../commands/mcp-index.js";
+import { searchLocal, searchCorpora, searchTranscripts, searchMulti, searchCluster, searchDedup, } from "../commands/search.js";
+import { telemetryFeedback, telemetryStats, telemetryHardNegatives, telemetryBackfillEmbeddings, telemetryRefreshHardNegatives, telemetryGetHardNegatives, } from "../commands/telemetry.js";
+import { configSnapshot } from "../commands/config.js";
+import { getMcpUrl } from "../mcp-client.js";
+function readVersion() {
+    try {
+        const here = dirname(fileURLToPath(import.meta.url));
+        const pkg = JSON.parse(readFileSync(join(here, "../../package.json"), "utf8"));
+        return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+    }
+    catch {
+        return "0.0.0";
+    }
+}
+await runAxiCli({
+    description: "CLI interface for the lore MCP knowledge server",
+    version: readVersion(),
+    topLevelHelp: TOP_LEVEL_HELP,
+    getCommandHelp: (command) => COMMAND_HELP[command] ?? null,
+    home: (_args) => homeCommand(_args),
+    commands: {
+        // KB
+        "kb-add": (args) => kbAdd(args),
+        "kb-search": (args) => kbSearch(args),
+        "kb-get": (args) => kbGet(args),
+        "kb-list": (args) => kbList(args),
+        "kb-update": (args) => kbUpdate(args),
+        "kb-delete": (args) => kbDelete(args),
+        "kb-ingest-doc": (args) => kbIngestDoc(args),
+        "kb-ingest-dir": (args) => kbIngestDir(args),
+        "kb-sync": (args) => kbSync(args),
+        "kb-embeddings": (args) => kbEmbeddings(args),
+        "kb-embedding-status": (args) => kbEmbeddingStatus(args),
+        // Investigation
+        "inv-add": (args) => invAdd(args),
+        "inv-list": (args) => invList(args),
+        "inv-get": (args) => invGet(args),
+        "inv-log-exp": (args) => invLogExp(args),
+        "inv-delete-note": (args) => invDeleteNote(args),
+        "inv-delete-exp": (args) => invDeleteExp(args),
+        "inv-list-exp": (args) => invListExp(args),
+        // Journal
+        "journal-append": (args) => journalAppend(args),
+        "journal-list": (args) => journalList(args),
+        "journal-get": (args) => journalGet(args),
+        "journal-search": (args) => journalSearch(args),
+        "journal-delete": (args) => journalDelete(args),
+        // MCP Index
+        "mcp-scan": (args) => mcpScan(args),
+        "mcp-search": (args) => mcpSearch(args),
+        "mcp-get-server": (args) => mcpGetServer(args),
+        "mcp-get-tool": (args) => mcpGetTool(args),
+        "mcp-rebuild": (args) => mcpRebuild(args),
+        // Search
+        "search-local": (args) => searchLocal(args),
+        "search-corpora": (args) => searchCorpora(args),
+        "search-transcripts": (args) => searchTranscripts(args),
+        "search-multi": (args) => searchMulti(args),
+        "search-cluster": (args) => searchCluster(args),
+        "search-dedup": (args) => searchDedup(args),
+        // Telemetry
+        "telemetry-feedback": (args) => telemetryFeedback(args),
+        "telemetry-stats": (args) => telemetryStats(args),
+        "telemetry-hard-negatives": (args) => telemetryHardNegatives(args),
+        "telemetry-backfill-embeddings": (args) => telemetryBackfillEmbeddings(args),
+        "telemetry-refresh-hard-negatives": (args) => telemetryRefreshHardNegatives(args),
+        "telemetry-get-hard-negatives": (args) => telemetryGetHardNegatives(args),
+        // Config
+        "config-snapshot": (args) => configSnapshot(args),
+        // Setup
+        setup: async (args) => {
+            const sub = args[0];
+            if (!sub) {
+                throw new AxiError("setup subcommand is required", "VALIDATION_ERROR", [
+                    "lore-axi setup hooks    — Install session-start hooks",
+                    "lore-axi setup config   — Show MCP server URL",
+                ]);
+            }
+            if (sub === "hooks") {
+                installSessionStartHooks({
+                    marker: "lore-axi",
+                    binaryNames: ["lore-axi"],
+                });
+                return { setup: "hooks installed or already up to date" };
+            }
+            if (sub === "config") {
+                return {
+                    mcp_server_url: getMcpUrl(),
+                    env_var: "LORE_MCP_URL",
+                    description: "Set LORE_MCP_URL to override the default MCP server URL",
+                };
+            }
+            throw new AxiError(`unknown setup command: ${sub}`, "VALIDATION_ERROR", [
+                "lore-axi setup hooks    — Install session-start hooks",
+                "lore-axi setup config   — Show MCP server URL",
+            ]);
+        },
+    },
+});
+//# sourceMappingURL=lore-axi.js.map
