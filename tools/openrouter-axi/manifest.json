@@ -1,0 +1,22 @@
+{
+  "name": "openrouter-axi",
+  "version": "1.0.0",
+  "description": "OpenRouter unified AI API — credits, models, keys, activity",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "OPENROUTER_AXI_API_KEY": "",
+    "OPENROUTER_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "credits", "desc": "Get credit balance", "args": []},
+    {"name": "models", "desc": "List available models", "args": ["--search", "--limit"]},
+    {"name": "model", "desc": "Get model details", "args": ["<model-id>"]},
+    {"name": "keys", "desc": "List API keys", "args": []},
+    {"name": "activity", "desc": "Recent generation activity", "args": ["--limit"]},
+    {"name": "params", "desc": "Get model parameters", "args": ["<model-id>"]},
+    {"name": "status", "desc": "Test auth and show key info", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-openrouter-axi.js"
+}

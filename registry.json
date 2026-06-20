@@ -236,6 +236,133 @@
       ],
       "has_plugin": true,
       "has_skill": false
+    },
+    {
+      "name": "exa-axi",
+      "version": "1.0.0",
+      "description": "AI-powered web search via Exa API",
+      "runtime": "node >= 18",
+      "path": "tools/exa-axi",
+      "env": {
+        "EXA_AXI_API_KEY": "Exa API key (required)",
+        "EXA_AXI_URL": "Override Exa API base URL"
+      },
+      "commands": [
+        "search",
+        "similar",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "tavily-axi",
+      "version": "1.0.0",
+      "description": "Real-time web search via Tavily API",
+      "runtime": "node >= 18",
+      "path": "tools/tavily-axi",
+      "env": {
+        "TAVILY_AXI_API_KEY": "Tavily API key (required)",
+        "TAVILY_AXI_URL": "Override Tavily API base URL"
+      },
+      "commands": [
+        "search",
+        "extract",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "weather-axi",
+      "version": "1.0.0",
+      "description": "Weather forecasts, alerts, air quality (OpenMeteo + NOAA, free, no API key)",
+      "runtime": "node >= 18",
+      "path": "tools/weather-axi",
+      "env": {
+        "WEATHER_AXI_URL": "Override weather API base URL"
+      },
+      "commands": [
+        "forecast",
+        "current",
+        "alerts",
+        "air-quality",
+        "locate",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "openrouter-axi",
+      "version": "1.0.0",
+      "description": "OpenRouter unified AI API — credits, models, keys, activity",
+      "runtime": "node >= 18",
+      "path": "tools/openrouter-axi",
+      "env": {
+        "OPENROUTER_AXI_API_KEY": "OpenRouter API key (required)",
+        "OPENROUTER_AXI_URL": "Override OpenRouter API base URL"
+      },
+      "commands": [
+        "credits",
+        "models",
+        "model",
+        "keys",
+        "activity",
+        "params",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "nextcloud-axi",
+      "version": "1.0.0",
+      "description": "Nextcloud file ops, shares, user info via WebDAV + OCS API",
+      "runtime": "node >= 18",
+      "path": "tools/nextcloud-axi",
+      "env": {
+        "NEXTCLOUD_AXI_URL": "Nextcloud server URL",
+        "NEXTCLOUD_AXI_USER": "Nextcloud username",
+        "NEXTCLOUD_AXI_PASSWORD": "Nextcloud app password"
+      },
+      "commands": [
+        "files list",
+        "files upload",
+        "files download",
+        "files delete",
+        "files mkdir",
+        "files move",
+        "files share",
+        "shares list",
+        "user info",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
+    },
+    {
+      "name": "ocr-axi",
+      "version": "1.0.0",
+      "description": "OCR and doc scanning (Tesseract, OpenRouter vision, ocrmypdf, scanimage, Polycr)",
+      "runtime": "node >= 18",
+      "path": "tools/ocr-axi",
+      "env": {
+        "OCR_AXI_URL": "Override OCR API base URL",
+        "POLYCR_HOST": "Polycr OCR service host",
+        "SCANNER_DEVICE": "scanimage device string"
+      },
+      "commands": [
+        "image",
+        "pdf",
+        "pdf-text",
+        "pdf-pages",
+        "scan",
+        "polycr",
+        "status"
+      ],
+      "has_plugin": true,
+      "has_skill": false
     }
   ]
 }

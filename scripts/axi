@@ -322,7 +322,7 @@ USAGE
 
 COMMANDS
   install <name>       Install a specific AXI tool
-  install --all         Install all 8 AXI tools
+  install --all         Install all 16 AXI tools
   list                  List available vs installed AXIs
   update <name>         Re-download latest version of a tool
   status                Health-check installed AXIs
@@ -345,6 +345,12 @@ TOOLS
   npm-axi             npm registry search
   fastmail-axi         Fastmail email, contacts, calendar via JMAP
   workspace-axi        Google Workspace — Gmail, Drive, Calendar, Docs, Contacts, Tasks
+  exa-axi              AI-powered web search via Exa API
+  tavily-axi           Real-time web search via Tavily API
+  weather-axi          Weather forecasts, alerts, air quality (free, no API key)
+  openrouter-axi       OpenRouter AI API — credits, models, keys, activity
+  nextcloud-axi        Nextcloud file ops, shares, user info (WebDAV + OCS)
+  ocr-axi              OCR and document scanning (Tesseract, ocrmypdf, scanimage)
 
 INSTALL PATHS
   Binaries    → ~/.local/bin/<name>-axi

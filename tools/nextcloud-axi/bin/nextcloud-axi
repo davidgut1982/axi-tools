@@ -1,0 +1,651 @@
+#!/usr/bin/env node
+// nextcloud-axi — Nextcloud WebDAV + OCS API via direct HTTP calls
+// Zero dependencies. TOON output. Agent-friendly.
+// Docs: https://docs.nextcloud.com/server/latest/developer_manual/
+
+const https = require('https');
+const http = require('http');
+const urlModule = require('url');
+const fs = require('fs');
+const pathModule = require('path');
+
+// ── Configuration ───────────────────────────────────
+
+const BASE_URL = (process.env.NEXTCLOUD_AXI_URL || process.env.NEXTCLOUD_URL || '').replace(/\/+$/, '');
+const USER = process.env.NEXTCLOUD_AXI_USER || process.env.NEXTCLOUD_USER || '';
+const PASSWORD = process.env.NEXTCLOUD_AXI_PASSWORD || process.env.NEXTCLOUD_PASSWORD || '';
+const AUTH_HEADER = USER && PASSWORD ? 'Basic ' + Buffer.from(USER + ':' + PASSWORD).toString('base64') : '';
+const TIMEOUT_MS = 30000;
+
+// ── HTTP request helper ─────────────────────────────
+
+function httpRequest(method, path, options) {
+  options = options || {};
+  return new Promise(function(resolve, reject) {
+    var parsed = urlModule.parse(BASE_URL);
+    var isHttps = parsed.protocol === 'https:';
+
+    var reqOpts = {
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: path,
+      method: method,
+      headers: {},
+      timeout: TIMEOUT_MS
+    };
+
+    // Auth
+    if (AUTH_HEADER) {
+      reqOpts.headers['Authorization'] = AUTH_HEADER;
+    }
+
+    // Content-Type
+    if (options.contentType) {
+      reqOpts.headers['Content-Type'] = options.contentType;
+    }
+
+    // OCS API header
+    if (options.ocs) {
+      reqOpts.headers['OCS-APIRequest'] = 'true';
+    }
+
+    // Custom headers (e.g. Destination for MOVE)
+    if (options.headers) {
+      var h = options.headers;
+      for (var k in h) {
+        if (h.hasOwnProperty(k)) reqOpts.headers[k] = h[k];
+      }
+    }
+
+    // Body
+    var bodyPayload = null;
+    if (options.body != null) {
+      bodyPayload = options.body;
+      if (typeof bodyPayload === 'string' || Buffer.isBuffer(bodyPayload)) {
+        reqOpts.headers['Content-Length'] = Buffer.byteLength(bodyPayload);
+      }
+    }
+
+    var proto = isHttps ? https : http;
+
+    var req = proto.request(reqOpts, function(res) {
+      // For downloads, stream to file
+      if (options.downloadPath && res.statusCode >= 200 && res.statusCode < 300) {
+        var fileStream = fs.createWriteStream(options.downloadPath);
+        var size = 0;
+        res.on('data', function(c) { size += c.length; fileStream.write(c); });
+        res.on('end', function() {
+          fileStream.end();
+          resolve({ statusCode: res.statusCode, size: size, headers: res.headers });
+        });
+        res.on('error', function(e) {
+          try { fileStream.end(); } catch (_) {}
+          reject(e);
+        });
+        return;
+      }
+
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var raw = Buffer.concat(chunks).toString('utf8');
+        var result = { statusCode: res.statusCode, headers: res.headers, raw: raw };
+
+        // Try JSON parse for non-WebDAV responses
+        if (options.json !== false) {
+          try { result.data = JSON.parse(raw); } catch (_) { result.data = null; }
+        }
+
+        if (res.statusCode >= 400) {
+          var msg = raw.slice(0, 500);
+          if (result.data && result.data.ocs && result.data.ocs.meta && result.data.ocs.meta.message) {
+            msg = result.data.ocs.meta.message;
+          } else if (result.data && result.data.message) {
+            msg = result.data.message;
+          }
+          reject(new Error('HTTP ' + res.statusCode + ': ' + msg));
+          return;
+        }
+
+        resolve(result);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', function(e) {
+      if (e.code === 'ENOTFOUND' || e.code === 'ECONNREFUSED') {
+        reject(new Error('cannot reach ' + BASE_URL + ' (' + e.code + ')'));
+      } else {
+        reject(e);
+      }
+    });
+    req.on('timeout', function() {
+      req.destroy();
+      reject(new Error('request timeout after ' + (TIMEOUT_MS / 1000) + 's'));
+    });
+
+    if (bodyPayload) {
+      req.write(bodyPayload);
+    }
+
+    req.end();
+  });
+}
+
+// ── WebDAV path builder ─────────────────────────────
+
+function webdavPath(remotePath) {
+  var clean = (remotePath || '').replace(/^\/+/, '').replace(/\/+$/, '');
+  return '/remote.php/dav/files/' + encodeURIComponent(USER) + (clean ? '/' + encodePath(clean) : '/');
+}
+
+function encodePath(p) {
+  return p.split('/').map(function(s) { return encodeURIComponent(s); }).join('/');
+}
+
+function decodePath(p) {
+  return decodeURIComponent(p);
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') return JSON.stringify(v);
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+// ── CLI helpers ─────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+function requireArg(args, idx, name) {
+  if (idx >= args.length || args[idx].startsWith('-')) {
+    die('missing ' + name);
+  }
+  return args[idx];
+}
+
+// ── Parsing helpers ─────────────────────────────────
+
+function parsePropfind(xml) {
+  var entries = [];
+  var responseRegex = /<d:response>([\s\S]*?)<\/d:response>/g;
+  var match;
+
+  while ((match = responseRegex.exec(xml)) !== null) {
+    var block = match[1];
+    var entry = {};
+
+    var hrefMatch = /<d:href>([^<]+)<\/d:href>/.exec(block);
+    if (hrefMatch) {
+      entry.href = decodePath(hrefMatch[1]);
+    }
+
+    var nameMatch = /<oc:display-name>([^<]+)<\/oc:display-name>/.exec(block) ||
+                    /<d:displayname>([^<]+)<\/d:displayname>/.exec(block);
+    if (nameMatch) {
+      entry.name = nameMatch[1];
+    } else if (entry.href) {
+      var parts = entry.href.replace(/\/+$/, '').split('/');
+      entry.name = parts[parts.length - 1] || '/';
+    }
+
+    if (/<d:collection\s*\/?>/.test(block)) {
+      entry.type = 'dir';
+    } else {
+      entry.type = 'file';
+    }
+
+    var sizeMatch = /<oc:size>(\d+)<\/oc:size>/.exec(block) ||
+                    /<d:getcontentlength>(\d+)<\/d:getcontentlength>/.exec(block);
+    if (sizeMatch) {
+      entry.size = parseInt(sizeMatch[1], 10);
+    }
+
+    var modMatch = /<d:getlastmodified>([^<]+)<\/d:getlastmodified>/.exec(block);
+    if (modMatch) {
+      entry.modified = modMatch[1];
+    }
+
+    var ctMatch = /<d:getcontenttype>([^<]+)<\/d:getcontenttype>/.exec(block);
+    if (ctMatch) {
+      entry.content_type = ctMatch[1];
+    }
+
+    entries.push(entry);
+  }
+
+  return entries;
+}
+
+function formatBytes(bytes) {
+  if (bytes == null) return '-';
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'K';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + 'M';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + 'G';
+}
+
+function formatFileEntry(e) {
+  var icon = e.type === 'dir' ? '📁' : '📄';
+  var name = e.name || e.href || '?';
+  if (e.type === 'dir' && !name.endsWith('/')) name += '/';
+  var parts = [icon + ' ' + name, e.type || '?', formatBytes(e.size)];
+  if (e.modified) parts.push(e.modified);
+  return parts.join(' | ');
+}
+
+// ── Commands ────────────────────────────────────────
+
+async function cmdFilesList(args) {
+  var remotePath = flagVal(args, '--path') || flagVal(args, '-p') || '/';
+  var limit = parseInt(flagVal(args, '--limit') || '100', 10);
+
+  var davPath = webdavPath(remotePath);
+
+  var propfindBody = '<?xml version="1.0"?>' +
+    '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">' +
+    '<d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getcontenttype/><oc:display-name/>' +
+    '</d:prop></d:propfind>';
+
+  var result = await httpRequest('PROPFIND', davPath, {
+    body: propfindBody,
+    contentType: 'application/xml',
+    json: false
+  });
+
+  var entries = parsePropfind(result.raw);
+  if (entries.length > 0) entries = entries.slice(1); // skip self
+  if (limit && entries.length > limit) entries = entries.slice(0, limit);
+
+  var label = (remotePath === '/' ? '/' : remotePath);
+  console.log('ok: true');
+  console.log('files[' + entries.length + ']{name,type,size,modified} path=' + label + ':');
+
+  for (var i = 0; i < entries.length; i++) {
+    console.log('  ' + formatFileEntry(entries[i]));
+  }
+
+  if (entries.length > 0) {
+    console.log('help[2]:');
+    console.log('  nextcloud-axi files list --path ' + label + ' --limit 50');
+    var first = entries[0];
+    if (first.type === 'dir') {
+      console.log('  nextcloud-axi files list --path ' + label + (label.endsWith('/') ? '' : '/') + first.name.replace(/\/$/, ''));
+    } else {
+      console.log('  nextcloud-axi files download ' + (label === '/' ? '/' : label + '/') + first.name);
+    }
+  }
+}
+
+async function cmdFilesUpload(args) {
+  var localFile = requireArg(args, 2, 'local-file');
+  var remotePath = flagVal(args, '--path') || flagVal(args, '-p');
+  if (!remotePath) die('missing --path for remote destination');
+
+  var localBuffer;
+  try {
+    localBuffer = fs.readFileSync(localFile);
+  } catch (e) {
+    die('cannot read local file: ' + localFile + ' (' + e.message + ')');
+  }
+
+  var davPath = webdavPath(remotePath);
+  await httpRequest('PUT', davPath, {
+    body: localBuffer,
+    contentType: 'application/octet-stream',
+    json: false
+  });
+
+  console.log('ok: true');
+  console.log('uploaded: ' + remotePath);
+  console.log('  size: ' + formatBytes(localBuffer.length));
+  console.log('  source: ' + localFile);
+}
+
+async function cmdFilesDownload(args) {
+  var remotePath = requireArg(args, 2, 'remote-path');
+  var localPath = flagVal(args, '--local') || flagVal(args, '-o') ||
+    pathModule.basename(remotePath.replace(/\/+$/, '').split('/').pop() || 'download');
+
+  var davPath = webdavPath(remotePath);
+  var result = await httpRequest('GET', davPath, {
+    downloadPath: localPath,
+    json: false
+  });
+
+  console.log('ok: true');
+  console.log('downloaded: ' + remotePath);
+  console.log('  local: ' + localPath);
+  console.log('  size: ' + formatBytes(result.size));
+}
+
+async function cmdFilesDelete(args) {
+  var remotePath = requireArg(args, 2, 'remote-path');
+  if (!hasFlag(args, '--yes') && !hasFlag(args, '-y')) {
+    die('use --yes to confirm deletion of ' + remotePath);
+  }
+
+  var davPath = webdavPath(remotePath);
+  await httpRequest('DELETE', davPath, { json: false });
+
+  console.log('ok: true');
+  console.log('deleted: ' + remotePath);
+}
+
+async function cmdFilesMkdir(args) {
+  var remotePath = requireArg(args, 2, 'path');
+  var davPath = webdavPath(remotePath);
+  await httpRequest('MKCOL', davPath, { json: false });
+
+  console.log('ok: true');
+  console.log('created: ' + remotePath);
+}
+
+async function cmdFilesMove(args) {
+  var fromPath = requireArg(args, 2, 'source-path');
+  var toPath = requireArg(args, 3, 'dest-path');
+
+  var fromDav = webdavPath(fromPath);
+  var toUrl = BASE_URL + webdavPath(toPath);
+
+  await httpRequest('MOVE', fromDav, {
+    headers: { 'Destination': toUrl },
+    json: false
+  });
+
+  console.log('ok: true');
+  console.log('moved: ' + fromPath + ' → ' + toPath);
+}
+
+async function cmdFilesShare(args) {
+  var remotePath = requireArg(args, 2, 'path');
+  var shareType = parseInt(flagVal(args, '--type') || '3', 10);
+  var shareWith = flagVal(args, '--with') || '';
+  var permissions = flagVal(args, '--permissions') || '1';
+  var password = flagVal(args, '--password') || '';
+
+  var validTypes = [0, 1, 3, 7];
+  if (validTypes.indexOf(shareType) === -1) {
+    die('invalid share type: ' + shareType + ' (use 0=user, 1=group, 3=public_link, 7=circle)');
+  }
+
+  var qsParts = [];
+  qsParts.push('path=' + encodeURIComponent(remotePath));
+  qsParts.push('shareType=' + shareType);
+  if (shareWith) qsParts.push('shareWith=' + encodeURIComponent(shareWith));
+  qsParts.push('permissions=' + permissions);
+  if (password) qsParts.push('password=' + encodeURIComponent(password));
+
+  var ocsPath = '/ocs/v2.php/apps/files_sharing/api/v1/shares';
+  var bodyStr = qsParts.join('&');
+
+  var result = await httpRequest('POST', ocsPath, {
+    body: bodyStr,
+    contentType: 'application/x-www-form-urlencoded',
+    ocs: true,
+    json: true
+  });
+
+  var shareData = result.data && result.data.ocs && result.data.ocs.data;
+
+  console.log('ok: true');
+  console.log('shared: ' + remotePath);
+  if (shareData) {
+    console.log('  share_id: ' + (shareData.id || '?'));
+    console.log('  type: ' + [null, 'user', 'group', 'public_link', null, null, null, 'circle'][shareType]);
+    if (shareData.url) console.log('  url: ' + shareData.url);
+    if (shareData.token) console.log('  token: ' + shareData.token);
+    if (shareData.share_with) console.log('  share_with: ' + shareData.share_with);
+  }
+}
+
+async function cmdSharesList() {
+  var ocsPath = '/ocs/v2.php/apps/files_sharing/api/v1/shares';
+  var result = await httpRequest('GET', ocsPath, { ocs: true, json: true });
+
+  var shares = (result.data && result.data.ocs && result.data.ocs.data) || [];
+
+  console.log('ok: true');
+  console.log('shares[' + shares.length + ']{id,path,type,permissions}:');
+
+  for (var i = 0; i < shares.length; i++) {
+    var s = shares[i];
+    var typeMap = { 0: 'user', 1: 'group', 3: 'public', 7: 'circle' };
+    var parts = [
+      String(s.id || '?'),
+      s.file_target || s.path || '?',
+      typeMap[s.share_type] || s.share_type || '?'
+    ];
+    if (s.share_with) parts.push(s.share_with);
+    if (s.url) parts.push(s.url.slice(0, 40) + (s.url.length > 40 ? '...' : ''));
+    console.log('  - ' + parts.join(' | '));
+  }
+}
+
+async function cmdUserInfo() {
+  var ocsPath = '/ocs/v1.php/cloud/users/' + encodeURIComponent(USER);
+  var result = await httpRequest('GET', ocsPath, { ocs: true, json: true });
+
+  var userData = result.data && result.data.ocs && result.data.ocs.data;
+
+  console.log('ok: true');
+  console.log('user:');
+  if (userData) {
+    console.log('  id: ' + (userData.id || USER));
+    console.log('  display_name: ' + (userData.displayname || userData['display-name'] || '?'));
+    console.log('  email: ' + (userData.email || userData['email'] || '?'));
+    if (userData.quota) console.log('  quota: ' + userData.quota);
+    if (userData.enabled != null) console.log('  enabled: ' + userData.enabled);
+    if (userData.storage) {
+      console.log('  storage:');
+      if (userData.storage.free != null) console.log('    free: ' + formatBytes(userData.storage.free));
+      if (userData.storage.used != null) console.log('    used: ' + formatBytes(userData.storage.used));
+      if (userData.storage.total != null) console.log('    total: ' + formatBytes(userData.storage.total));
+    }
+  } else {
+    console.log(toon(result.data));
+  }
+}
+
+async function cmdStatus() {
+  if (!BASE_URL) {
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: no_url');
+    console.log('  error: NEXTCLOUD_AXI_URL not set');
+    console.log('  user: ' + (USER || '(not set)'));
+    process.exit(0);
+  }
+
+  var start = Date.now();
+  var davPath = webdavPath('/');
+  var propfindBody = '<?xml version="1.0"?>' +
+    '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
+
+  try {
+    await httpRequest('PROPFIND', davPath, {
+      body: propfindBody,
+      contentType: 'application/xml',
+      json: false,
+      ocs: false
+    });
+    var elapsed = Date.now() - start;
+
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: ok');
+    console.log('  latency_ms: ' + elapsed);
+    console.log('  user: ' + USER);
+    console.log('  server: ' + BASE_URL);
+  } catch (e) {
+    var elapsed2 = Date.now() - start;
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: error');
+    console.log('  latency_ms: ' + elapsed2);
+    console.log('  error: ' + e.message);
+    console.log('  user: ' + USER);
+    console.log('  server: ' + BASE_URL);
+    process.exit(1);
+  }
+}
+
+function cmdHelp() {
+  console.log('nextcloud-axi <command> [options]');
+  console.log('');
+  console.log('Files (WebDAV):');
+  console.log('  files list [--path /path] [--limit N]    List files in a directory');
+  console.log('      PROPFIND /remote.php/dav/files/<user>/<path>');
+  console.log('');
+  console.log('  files upload <local-file> --path <remote>  Upload a file');
+  console.log('      PUT /remote.php/dav/files/<user>/<remote>');
+  console.log('');
+  console.log('  files download <remote-path> [--local p]   Download a file');
+  console.log('      GET /remote.php/dav/files/<user>/<remote>');
+  console.log('');
+  console.log('  files delete <remote-path> [--yes]         Delete a file');
+  console.log('      DELETE /remote.php/dav/files/<user>/<remote>');
+  console.log('');
+  console.log('  files mkdir <path>                          Create directory');
+  console.log('      MKCOL /remote.php/dav/files/<user>/<path>');
+  console.log('');
+  console.log('  files move <from> <to>                      Move/rename file');
+  console.log('      MOVE /remote.php/dav/files/<user>/<from>');
+  console.log('');
+  console.log('  files share <path> [--type 0|1|3|7]        Share a file');
+  console.log('      [--with user] [--permissions N] [--password pwd]');
+  console.log('      POST /ocs/v2.php/apps/files_sharing/api/v1/shares');
+  console.log('');
+  console.log('Shares:');
+  console.log('  shares list                                 List all shares');
+  console.log('      GET /ocs/v2.php/apps/files_sharing/api/v1/shares');
+  console.log('');
+  console.log('User:');
+  console.log('  user info                                   Get user details');
+  console.log('      GET /ocs/v1.php/cloud/users/<user>');
+  console.log('');
+  console.log('Other:');
+  console.log('  status                                      Verify connectivity');
+  console.log('  help                                        Show this help');
+  console.log('');
+  console.log('Share types:');
+  console.log('  0 = user | 1 = group | 3 = public link | 7 = circle');
+  console.log('');
+  console.log('Env:');
+  console.log('  NEXTCLOUD_AXI_URL       Nextcloud server URL (e.g. https://nc.example.com)');
+  console.log('  NEXTCLOUD_AXI_USER      Username');
+  console.log('  NEXTCLOUD_AXI_PASSWORD  App password or login password');
+  console.log('');
+  console.log('Fallback env: NEXTCLOUD_URL, NEXTCLOUD_USER, NEXTCLOUD_PASSWORD');
+}
+
+// ── Main ────────────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+var sub = args[1];
+
+// Handle compound commands
+var fullCmd = cmd;
+if (cmd === 'files' && sub) fullCmd = 'files ' + sub;
+else if (cmd === 'shares' && sub === 'list') fullCmd = 'shares list';
+else if (cmd === 'user' && sub === 'info') fullCmd = 'user info';
+
+if (!cmd || hasFlag(args, '--help') || hasFlag(args, '-h') || cmd === 'help') {
+  cmdHelp();
+  process.exit(0);
+}
+
+if (fullCmd !== 'help' && fullCmd !== 'status') {
+  if (!BASE_URL) die('NEXTCLOUD_AXI_URL not set');
+}
+
+// Most commands need auth; status is more forgiving
+var needsAuth = [
+  'files list', 'files upload', 'files download', 'files delete',
+  'files mkdir', 'files move', 'files share', 'shares list', 'user info'
+];
+if (needsAuth.indexOf(fullCmd) !== -1 && !AUTH_HEADER) {
+  die('NEXTCLOUD_AXI_USER and NEXTCLOUD_AXI_PASSWORD must be set');
+}
+
+(async function main() {
+  try {
+    switch (fullCmd) {
+      case 'files list':     await cmdFilesList(args); break;
+      case 'files upload':   await cmdFilesUpload(args); break;
+      case 'files download': await cmdFilesDownload(args); break;
+      case 'files delete':   await cmdFilesDelete(args); break;
+      case 'files mkdir':    await cmdFilesMkdir(args); break;
+      case 'files move':     await cmdFilesMove(args); break;
+      case 'files share':    await cmdFilesShare(args); break;
+      case 'shares list':    await cmdSharesList(); break;
+      case 'user info':      await cmdUserInfo(); break;
+      case 'status':         await cmdStatus(); break;
+      default:
+        die('unknown command: ' + (fullCmd || '?') + ' (use --help to see all commands)');
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();

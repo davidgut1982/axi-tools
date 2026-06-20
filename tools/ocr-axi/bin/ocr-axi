@@ -1,0 +1,859 @@
+#!/usr/bin/env node
+// ocr-axi — OCR and scanning AXI CLI
+// Zero npm dependencies. Uses local binaries (tesseract, ocrmypdf, scanimage, gs, pdftotext,
+// pdfinfo, pdftoppm, identify, convert) and optionally the Polycr HTTP service.
+// See: /home/david/ocr-mcp/ for the MCP predecessor this was extracted from.
+
+'use strict';
+
+const { execFile, execSync } = require('node:child_process');
+const fs = require('node:fs');
+const http = require('node:http');
+const https = require('node:https');
+const os = require('node:os');
+const path = require('node:path');
+const { promisify } = require('node:util');
+
+const execFileAsync = promisify(execFile);
+
+// ─── Config from env ──────────────────────────────────────────────────────────
+
+const POLYCR_HOST = process.env.POLYCR_HOST || 'polycr';
+const POLYCR_URL = process.env.POLYCR_URL || `http://${POLYCR_HOST}:8000`;
+const SCANNER_DEVICE = process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080';
+const CANON_ESCL_BASE = process.env.CANON_ESCL_BASE || 'http://192.168.1.141';
+const OCR_AXI_LANG = process.env.OCR_AXI_LANG || 'eng';
+
+// Vision OCR config (OpenRouter-compatible endpoint for image→text)
+const VISION_OCR_URL = process.env.VISION_OCR_URL || 'http://polycr:8000';
+const VISION_OCR_MODEL = process.env.VISION_OCR_MODEL || 'qwen/qwen3-vl-32b-instruct';
+
+// ─── Scanner device registry (from scanners.mjs) ─────────────────────────────
+
+const SCANNER_DEVICES = {
+  canon: {
+    label: 'Canon MF741C',
+    esclBase: process.env.CANON_ESCL_BASE || 'http://192.168.1.141',
+    aliases: ['canon', 'mf741c', '741c', '741', 'canon-mf741c'],
+    defaultProfile: 'doc-bw-adf',
+    esclVersion: '2.63',
+    documentFormat: 'image/jpeg',
+  },
+  hp: {
+    label: 'HP OfficeJet 5740',
+    esclBase: process.env.HP_ESCL_BASE || 'http://192.168.1.183:8080',
+    aliases: ['hp', 'hp 5000', 'hp5000', 'officejet', '5740', '5000', 'hp-officejet-5740'],
+    defaultProfile: 'doc-bw-adf',
+    esclVersion: '2.5',
+    documentFormat: 'application/pdf',
+  },
+};
+
+const DEFAULT_SCANNER_KEY = process.env.DEFAULT_SCANNER || 'canon';
+
+// Legacy SCANNERS map (device-name strings for scanimage)
+const SCANNERS = {
+  'hp-officejet-5740': process.env.SCANNER_DEVICE || 'escl:http://192.168.1.183:8080',
+  'canon-mf741c': 'airscan:e0:Canon MF741C',
+};
+const DEFAULT_SCANNER = SCANNERS['canon-mf741c'];
+
+// ─── Helper: tool availability check ─────────────────────────────────────────
+
+function checkTool(cmd) {
+  try {
+    execSync(`which ${JSON.stringify(cmd)}`, { stdio: 'ignore', timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let _cachedPolycrAvailable = null;
+async function checkPolycr() {
+  if (_cachedPolycrAvailable !== null) return _cachedPolycrAvailable;
+  try {
+    const resp = await fetchWithTimeout(`${POLYCR_URL}/health`, { method: 'GET' }, 5000);
+    _cachedPolycrAvailable = resp.ok;
+  } catch {
+    _cachedPolycrAvailable = false;
+  }
+  return _cachedPolycrAvailable;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────────────
+
+function fetchWithTimeout(url, options, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.request(url, { ...options, timeout: timeoutMs }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks);
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          json: () => JSON.parse(body.toString('utf-8')),
+          text: () => body.toString('utf-8'),
+          body: body,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('ETIMEDOUT')); });
+    if (options.body) {
+      if (Buffer.isBuffer(options.body)) {
+        req.write(options.body);
+      } else if (typeof options.body === 'string') {
+        req.write(options.body);
+      }
+    }
+    req.end();
+  });
+}
+
+function resolveVisionKey() {
+  const raw = process.env.VISION_OCR_KEY || process.env.OPENROUTER_API_KEY || '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === 'none' || trimmed === 'null') return null;
+  return trimmed;
+}
+
+function visionHeaders(extraHeaders = {}) {
+  const key = resolveVisionKey();
+  const base = {
+    'Content-Type': 'application/json',
+    'HTTP-Referer': 'https://ocr-axi.local',
+    'X-Title': 'OcrAxi-OCR-Vision',
+    ...extraHeaders,
+  };
+  if (key) base.Authorization = `Bearer ${key}`;
+  return base;
+}
+
+function countWords(text) {
+  if (!text || typeof text !== 'string') return 0;
+  return text.trim().split(/\s+/).filter((w) => w.length > 0).length;
+}
+
+// ─── TOON output ─────────────────────────────────────────────────────────────
+
+function toon(obj) {
+  // TOON format: key: value lines, arrays as indented items
+  if (Array.isArray(obj)) {
+    obj.forEach((item) => {
+      if (typeof item === 'object' && item !== null) {
+        for (const [k, v] of Object.entries(item)) {
+          process.stdout.write(`${k}: ${v}\n`);
+        }
+        process.stdout.write('\n');
+      } else {
+        process.stdout.write(`${item}\n`);
+      }
+    });
+  } else if (typeof obj === 'object' && obj !== null) {
+    for (const [k, v] of Object.entries(obj)) {
+      process.stdout.write(`${k}: ${v}\n`);
+    }
+  } else {
+    process.stdout.write(`${obj}\n`);
+  }
+}
+
+// ─── Core OCR functions (extracted from ocr-mcp/index.mjs) ───────────────────
+
+async function runLocalTesseract(filePath, language) {
+  const lang = language || OCR_AXI_LANG || 'eng';
+  const [textResult, tsvResult] = await Promise.all([
+    execFileAsync('tesseract', [filePath, 'stdout', '-l', lang]),
+    execFileAsync('tesseract', [filePath, 'stdout', '-l', lang, 'tsv']),
+  ]);
+  const text = textResult.stdout;
+  const lines = tsvResult.stdout.split('\n').slice(1);
+  const confs = lines
+    .map((l) => {
+      const cols = l.split('\t');
+      const level = parseInt(cols[0], 10);
+      const conf = parseFloat(cols[10]);
+      return level === 5 && conf >= 0 ? conf : null;
+    })
+    .filter((c) => c !== null);
+  const confidence =
+    confs.length > 0 ? Math.round(confs.reduce((a, b) => a + b, 0) / confs.length) / 100 : null;
+  const wc = countWords(text);
+  return { text, confidence, word_count: wc, empty: wc === 0 };
+}
+
+async function ocrWithFallback(filePath, language) {
+  const visionKey = resolveVisionKey();
+  if (visionKey && VISION_OCR_URL && VISION_OCR_URL !== 'http://polycr:8000') {
+    try {
+      const mimeMap = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        gif: 'image/gif', webp: 'image/webp', tiff: 'image/tiff', tif: 'image/tiff', bmp: 'image/bmp',
+      };
+      const buildDataUrl = () => {
+        const imgBuf = fs.readFileSync(filePath);
+        const ext = path.extname(filePath).slice(1).toLowerCase() || 'jpg';
+        const contentType = mimeMap[ext] || 'image/jpeg';
+        return `data:${contentType};base64,${imgBuf.toString('base64')}`;
+      };
+      let dataUrl = buildDataUrl();
+
+      const lang = language || OCR_AXI_LANG || 'eng';
+      const langHint =
+        lang === 'lav'
+          ? ' This document may contain Latvian text with diacritics (ā ē ī ō ū č ģ ķ ļ ņ š ž).'
+          : '';
+      const prompt =
+        `Extract all text from this document image exactly as it appears. ` +
+        `Preserve layout, line breaks, and punctuation faithfully.${langHint} ` +
+        `Return only the extracted text — no commentary or explanations.`;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 90000);
+        let resp;
+        try {
+          resp = await fetchWithTimeout(
+            `${VISION_OCR_URL}/v1/chat/completions`,
+            {
+              method: 'POST',
+              headers: visionHeaders(),
+              body: JSON.stringify({
+                model: VISION_OCR_MODEL,
+                messages: [{ role: 'user', content: [
+                  { type: 'image_url', image_url: { url: dataUrl } },
+                  { type: 'text', text: prompt },
+                ]}],
+                max_tokens: 4096,
+                temperature: 0.1,
+              }),
+            },
+            90000
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+
+        if (resp.ok) {
+          const data = resp.json();
+          const text = data?.choices?.[0]?.message?.content;
+          if (text && typeof text === 'string' && countWords(text) > 0) {
+            const modelLabel = VISION_OCR_MODEL.split('/').slice(-1)[0].replace(/-instruct$/, '');
+            return {
+              text: text.trim(),
+              engine_used: `openrouter:${modelLabel}`,
+              confidence: 0.92,
+              word_count: countWords(text),
+              empty: false,
+              fallback_reason: undefined,
+            };
+          }
+          break; // empty content → fall through to Tesseract
+        }
+
+        const errBody = resp.text();
+        if (resp.status === 400 && attempt === 0) {
+          normalizeScannedJpeg(filePath);
+          // Force re-encode even if identify passed
+          const before = fs.statSync(filePath).size;
+          if (fs.statSync(filePath).size === before) {
+            try {
+              const reenc = filePath.replace(/\.jpe?g$/i, '') + '_reenc.jpg';
+              execSync(`convert ${JSON.stringify(filePath)} -strip -quality 92 ${JSON.stringify(reenc)}`, { timeout: 30000 });
+              fs.renameSync(reenc, filePath);
+            } catch (_) {}
+          }
+          dataUrl = buildDataUrl();
+          continue;
+        }
+        break;
+      }
+    } catch (_) {}
+  }
+
+  // Fallback: local Tesseract
+  const local = await runLocalTesseract(filePath, language);
+  return {
+    text: local.text,
+    engine_used: 'tesseract-local',
+    confidence: local.confidence,
+    word_count: local.word_count,
+    empty: local.empty,
+    fallback_reason: 'vision OCR unavailable or empty — used local Tesseract',
+  };
+}
+
+function normalizeScannedJpeg(filePath) {
+  try {
+    execSync(`identify ${JSON.stringify(filePath)}`, { stdio: 'ignore', timeout: 15000 });
+    return filePath;
+  } catch (_) {
+    const normalized = filePath.replace(/\.jpe?g$/i, '') + '_norm.jpg';
+    try {
+      execSync(
+        `convert ${JSON.stringify(filePath)} -strip -quality 92 ${JSON.stringify(normalized)}`,
+        { timeout: 30000 }
+      );
+      fs.renameSync(normalized, filePath);
+    } catch (_) {}
+    return filePath;
+  }
+}
+
+async function createSearchablePdfFromJpeg(jpegPath, outPath, language) {
+  const lang = language || OCR_AXI_LANG || 'eng';
+  try {
+    await execFileAsync('ocrmypdf', [
+      '--rotate-pages', '--deskew', '--optimize', '1',
+      '--image-dpi', '300', '--language', lang,
+      jpegPath, outPath,
+    ]);
+    return { path: outPath, method: 'ocrmypdf-local' };
+  } catch (cliErr) {
+    try {
+      const outStem = outPath.replace(/\.pdf$/, '');
+      await execFileAsync('tesseract', [jpegPath, outStem, '-l', lang, 'pdf']);
+      return { path: outPath, method: 'tesseract-local' };
+    } catch (tesseractErr) {
+      throw new Error(
+        `PDF creation failed — ocrmypdf CLI: ${cliErr.message}; tesseract: ${tesseractErr.message}`
+      );
+    }
+  }
+}
+
+// ─── Polycr API (extracted from ocr-mcp/index.mjs _callPolycr) ───────────────
+
+async function callPolycr(filePath, language) {
+  const fileBytes = fs.readFileSync(filePath);
+  const ext = path.extname(filePath).slice(1).toLowerCase() || 'jpg';
+  const mimeMap = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+    gif: 'image/gif', webp: 'image/webp', tiff: 'image/tiff', bmp: 'image/bmp',
+  };
+  const mime = mimeMap[ext] || 'application/octet-stream';
+  const lang = language || OCR_AXI_LANG || 'eng';
+
+  const MAX_ATTEMPTS = 2;
+  const COLD_START_DELAY_MS = 10000;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+      const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(filePath)}"\r\nContent-Type: ${mime}\r\n\r\n`;
+      const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\n${lang}\r\n--${boundary}--\r\n`;
+      const body = Buffer.concat([Buffer.from(header), fileBytes, Buffer.from(footer)]);
+
+      const resp = await fetchWithTimeout(
+        `${POLYCR_URL}/ocr/raw`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+          body: body,
+        },
+        90000
+      );
+
+      if (!resp.ok) return { result: null, fallback_reason: `polycr HTTP ${resp.status}` };
+      const data = resp.json();
+      return { result: data, fallback_reason: null };
+    } catch (err) {
+      const isRetryable =
+        err?.name === 'AbortError' ||
+        err?.code === 'ECONNREFUSED' ||
+        err?.code === 'ETIMEDOUT' ||
+        err?.cause?.code === 'ECONNREFUSED' ||
+        err?.cause?.code === 'ETIMEDOUT' ||
+        /fetch failed/i.test(String(err?.message ?? err));
+      if (attempt < MAX_ATTEMPTS && isRetryable) {
+        await new Promise((r) => setTimeout(r, COLD_START_DELAY_MS));
+        continue;
+      }
+      const isTimeout = err?.name === 'AbortError';
+      return {
+        result: null,
+        fallback_reason: isTimeout ? 'polycr timeout (90s)' : `polycr unreachable: ${err.message}`,
+      };
+    }
+  }
+}
+
+function pickBestPolycr(data) {
+  const results = (data.results || []).filter((r) => r && typeof r.text === 'string' && !r.error);
+  if (results.length === 0) return null;
+
+  function firstLine(text) {
+    return (
+      text.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) || ''
+    ).toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  const confident = results.filter(
+    (r) => (typeof r.confidence === 'number' ? r.confidence : 0) >= 15
+  );
+  const pool = confident.length > 0 ? confident : results;
+
+  const firstLines = pool.map((r) => firstLine(r.text));
+  const lineCounts = {};
+  for (const l of firstLines) lineCounts[l] = (lineCounts[l] || 0) + 1;
+  const consensusLine = Object.entries(lineCounts).sort((a, b) => b[1] - a[1])[0];
+  const hasConsensus = consensusLine && consensusLine[1] >= 2;
+
+  let best = null;
+  let bestScore = -1;
+  for (const result of pool) {
+    const wc = countWords(result.text);
+    const conf = typeof result.confidence === 'number' ? result.confidence : 0;
+    let score = wc * 10 + conf;
+    if (hasConsensus && firstLine(result.text) === consensusLine[0]) score += 500;
+    if (score > bestScore) { bestScore = score; best = { engine_used: result.engine, text: result.text, confidence: conf / 100 }; }
+  }
+  return best;
+}
+
+// ─── PDF Pipeline functions (from pdfPipeline.mjs) ───────────────────────────
+
+async function ocrPdfWithOcrmypdf(inPdf, outPdf, language = 'eng', timeoutMs = 300000) {
+  try {
+    await execFileAsync('ocrmypdf', [
+      '--force-ocr', '--deskew', '--rotate-pages', '--optimize', '1',
+      '--output-type', 'pdf', '--language', language || 'eng',
+      inPdf, outPdf,
+    ], { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+    return { ok: true, outPdf, engine: 'ocrmypdf' };
+  } catch (err) {
+    const stderr = (err && (err.stderr || err.message)) || String(err);
+    return { ok: false, stderr: String(stderr).slice(0, 2000) };
+  }
+}
+
+async function pdfPageCount(pdfPath, timeoutMs = 30000) {
+  try {
+    const { stdout } = await execFileAsync('pdfinfo', [pdfPath], { timeout: timeoutMs });
+    const m = stdout.match(/^Pages:\s+(\d+)/m);
+    return m ? Number.parseInt(m[1], 10) : 0;
+  } catch { return 0; }
+}
+
+async function pdfExtractText(pdfPath, timeoutMs = 60000) {
+  try {
+    const { stdout } = await execFileAsync('pdftotext', [pdfPath, '-'], {
+      timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
+    });
+    const text = stdout || '';
+    const wordCount = (text.match(/\S+/g) || []).length;
+    return { text, word_count: wordCount };
+  } catch { return { text: '', word_count: 0 }; }
+}
+
+// ─── Resolve scanner (from scanners.mjs) ─────────────────────────────────────
+
+function resolveScanner(name) {
+  const needle = (name ?? DEFAULT_SCANNER_KEY).toLowerCase().trim();
+  for (const [key, device] of Object.entries(SCANNER_DEVICES)) {
+    if (key === needle || device.aliases.some((a) => a.toLowerCase() === needle)) {
+      return {
+        key,
+        label: device.label,
+        esclBase: device.esclBase,
+        defaultProfile: device.defaultProfile,
+        esclVersion: device.esclVersion,
+        documentFormat: device.documentFormat,
+      };
+    }
+  }
+  const validOptions = Object.entries(SCANNER_DEVICES)
+    .map(([k, d]) => `${k} (aliases: ${d.aliases.join(', ')})`)
+    .join('; ');
+  throw new Error(
+    `Unknown scanner "${name}". Valid options: ${validOptions}. Default (omit): ${DEFAULT_SCANNER_KEY}`
+  );
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+async function cmdImage(filePath, opts) {
+  if (!filePath) throw new Error('Usage: ocr-axi image <path> [--lang eng] [--output text|hocr|pdf]');
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  const lang = opts.lang || OCR_AXI_LANG || 'eng';
+  const outputFmt = (opts.output || 'text').toLowerCase();
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+
+  // For PDF input, route differently
+  if (ext === 'pdf') {
+    // Try pdftotext first
+    const ptResult = await pdfExtractText(filePath);
+    if (ptResult.word_count > 10) {
+      if (outputFmt === 'pdf') {
+        const outPath = filePath.replace(/\.pdf$/i, '_ocr.pdf');
+        const result = await ocrPdfWithOcrmypdf(filePath, outPath, lang);
+        if (result.ok) {
+          toon({ ok: 'true', result_pdf: result.outPdf, engine: result.engine, info: 'PDF already has text layer; ocrmypdf embedded searchable layer' });
+        } else {
+          toon({ ok: 'false', error: result.stderr });
+          process.exit(1);
+        }
+      } else {
+        toon({ ok: 'true', text: ptResult.text, engine: 'pdftotext', word_count: ptResult.word_count, empty: ptResult.word_count === 0 ? 'true' : 'false' });
+      }
+      return;
+    }
+    // No text layer — render page 1 and OCR
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_axi_'));
+    try {
+      const outPrefix = path.join(tmpDir, 'page');
+      await execFileAsync('pdftoppm', ['-jpeg', '-r', '200', '-l', '1', filePath, outPrefix]);
+      const pages = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.jpg')).sort();
+      if (pages.length === 0) throw new Error('pdftoppm produced no output');
+      const tmpJpeg = path.join(tmpDir, pages[0]);
+      const result = await ocrWithFallback(tmpJpeg, lang);
+      toon({ ok: 'true', text: result.text, engine_used: result.engine_used, confidence: result.confidence != null ? `${Math.round(result.confidence * 100)}%` : 'N/A', word_count: result.word_count, empty: result.empty ? 'true' : 'false', fallback_reason: result.fallback_reason || '' });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+    return;
+  }
+
+  if (outputFmt === 'pdf') {
+    const outPath = filePath.replace(new RegExp(`${path.extname(filePath)}$`), '_ocr.pdf');
+    const result = await createSearchablePdfFromJpeg(filePath, outPath, lang);
+    toon({ ok: 'true', pdf_path: result.path, method: result.method });
+    return;
+  }
+
+  // OCR with vision fallback → text output
+  const result = await ocrWithFallback(filePath, lang);
+  toon({
+    ok: 'true',
+    text: result.text,
+    engine_used: result.engine_used,
+    confidence: result.confidence != null ? `${Math.round(result.confidence * 100)}%` : 'N/A',
+    word_count: result.word_count,
+    empty: result.empty ? 'true' : 'false',
+    fallback_reason: result.fallback_reason || '',
+  });
+}
+
+async function cmdPdf(filePath, opts) {
+  if (!filePath) throw new Error('Usage: ocr-axi pdf <path> [--output-dir dir]');
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  const outDir = opts['output-dir'] || path.dirname(filePath);
+  const basename = path.basename(filePath, path.extname(filePath));
+  const outPath = path.join(outDir, `${basename}_ocr.pdf`);
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const lang = opts.lang || OCR_AXI_LANG || 'eng';
+
+  const result = await ocrPdfWithOcrmypdf(filePath, outPath, lang);
+  if (result.ok) {
+    const pages = await pdfPageCount(result.outPdf);
+    const textResult = await pdfExtractText(result.outPdf);
+    toon({
+      ok: 'true',
+      output_pdf: result.outPdf,
+      engine: result.engine,
+      pages: String(pages),
+      word_count: String(textResult.word_count),
+    });
+  } else {
+    toon({ ok: 'false', error: result.stderr });
+    process.exit(1);
+  }
+}
+
+async function cmdPdfText(filePath) {
+  if (!filePath) throw new Error('Usage: ocr-axi pdf-text <path>');
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  const result = await pdfExtractText(filePath);
+  if (result.word_count === 0) {
+    // Try OCR fallback
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_axi_'));
+    try {
+      const outPrefix = path.join(tmpDir, 'page');
+      await execFileAsync('pdftoppm', ['-jpeg', '-r', '200', '-l', '1', filePath, outPrefix]);
+      const pages = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.jpg')).sort();
+      if (pages.length > 0) {
+        const ocrResult = await ocrWithFallback(path.join(tmpDir, pages[0]));
+        toon({
+          ok: 'true',
+          text: ocrResult.text,
+          engine_used: ocrResult.engine_used,
+          word_count: String(ocrResult.word_count),
+          note: 'No text layer in PDF; OCR performed on page 1',
+        });
+        return;
+      }
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+  toon({ ok: 'true', text: result.text, word_count: String(result.word_count), empty: result.word_count === 0 ? 'true' : 'false' });
+}
+
+async function cmdPdfPages(filePath) {
+  if (!filePath) throw new Error('Usage: ocr-axi pdf-pages <path>');
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  const pages = await pdfPageCount(filePath);
+  toon({ ok: 'true', file: filePath, pages: String(pages) });
+}
+
+async function cmdScan(opts) {
+  const device = opts.device || DEFAULT_SCANNER_KEY;
+  const format = formatForOutput(opts.format || 'jpeg');
+  const dpi = opts.dpi || 300;
+  const tstamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const ext = format === 'pdf' ? '.pdf' : '.jpg';
+  const outputPath = opts.output || path.join(os.tmpdir(), `scan_${tstamp}${ext}`);
+
+  // Resolve scanner
+  let resolvedDevice;
+  try {
+    resolvedDevice = resolveScanner(device);
+  } catch (e) {
+    toon({ ok: 'false', error: e.message });
+    process.exit(1);
+  }
+
+  // Legacy scanimage path (flatbed, single page)
+  const legacyKey = resolvedDevice.key === 'canon' ? 'canon-mf741c' : resolvedDevice.key === 'hp' ? 'hp-officejet-5740' : null;
+  const deviceName = (legacyKey && SCANNERS[legacyKey]) || DEFAULT_SCANNER;
+
+  // eSCL ADF path (multi-page via HTTP) is complex — for the basic scan command,
+  // use scanimage which handles both flatbed and ADF (simplex) reliably
+  try {
+    execSync(
+      `scanimage --device-name=${JSON.stringify(deviceName)} --format=${format} --output-file=${JSON.stringify(outputPath)} --resolution=${dpi} --mode=Color --source=Flatbed`,
+      { timeout: 120000 }
+    );
+    const size = fs.statSync(outputPath).size;
+    toon({
+      ok: 'true',
+      path: outputPath,
+      device: resolvedDevice.key,
+      label: resolvedDevice.label,
+      format: format,
+      resolution: `${dpi}dpi`,
+      size_bytes: String(size),
+    });
+  } catch (e) {
+    toon({ ok: 'false', error: e.message, device: resolvedDevice.key });
+    process.exit(1);
+  }
+}
+
+function formatForOutput(fmt) {
+  const f = fmt.toLowerCase();
+  if (f === 'pdf') return 'pdf';
+  if (f === 'png') return 'png';
+  return 'jpeg';
+}
+
+async function cmdPolycr(filePath, opts) {
+  if (!filePath) throw new Error('Usage: ocr-axi polycr <image-or-pdf-path> [--mode document|photo]');
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  const lang = opts.lang || OCR_AXI_LANG || 'eng';
+  const mode = opts.mode || 'document';
+
+  // If input is PDF, render page 1 as JPEG first
+  let targetFile = filePath;
+  let tmpDir = null;
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  if (ext === 'pdf') {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_axi_polycr_'));
+    try {
+      const outPrefix = path.join(tmpDir, 'page');
+      await execFileAsync('pdftoppm', ['-jpeg', '-r', '200', '-l', '1', filePath, outPrefix]);
+      const pages = fs.readdirSync(tmpDir).filter((f) => f.endsWith('.jpg')).sort();
+      if (pages.length > 0) {
+        targetFile = path.join(tmpDir, pages[0]);
+      }
+    } catch (e) {
+      throw new Error(`pdftoppm failed: ${e.message}`);
+    }
+  }
+
+  try {
+    const polycrResult = await callPolycr(targetFile, lang);
+    if (!polycrResult.result) {
+      // Fallback to local OCR
+      toon({
+        ok: 'true',
+        text: '',
+        engine_used: 'none',
+        fallback_reason: polycrResult.fallback_reason || 'polycr unreachable',
+        note: 'Polycr unavailable — use `ocr-axi image` for local Tesseract OCR',
+      });
+      return;
+    }
+
+    const best = pickBestPolycr(polycrResult.result);
+    if (!best) {
+      toon({ ok: 'true', text: '', engine_used: 'none', fallback_reason: 'polycr returned no valid results' });
+      return;
+    }
+
+    // List all engines
+    const engines = (polycrResult.result.results || []).map((r) => ({
+      engine: r.engine || 'unknown',
+      confidence: r.confidence != null ? `${r.confidence}%` : 'N/A',
+      text_preview: (r.text || '').slice(0, 80).replace(/\n/g, ' '),
+    }));
+
+    toon({
+      ok: 'true',
+      text: best.text,
+      engine_used: best.engine_used,
+      confidence: best.confidence != null ? `${Math.round(best.confidence * 100)}%` : 'N/A',
+      mode: mode,
+      all_engines: engines.map((e) => `  ${e.engine}: conf=${e.confidence} "${e.text_preview}..."`).join('\n') || 'none',
+    });
+  } finally {
+    if (tmpDir) {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+}
+
+async function cmdStatus() {
+  const tesseractOk = checkTool('tesseract');
+  const ocrmypdfOk = checkTool('ocrmypdf');
+  const scanimageOk = checkTool('scanimage');
+  const gsOk = checkTool('gs');
+  const pdftotextOk = checkTool('pdftotext');
+  const pdfinfoOk = checkTool('pdfinfo');
+  const pdftoppmOk = checkTool('pdftoppm');
+  const identifyOk = checkTool('identify');
+  const convertOk = checkTool('convert');
+  const polycrOk = await checkPolycr();
+
+  toon({
+    ok: 'true',
+    tesseract: tesseractOk ? 'available' : 'unavailable',
+    ocrmypdf: ocrmypdfOk ? 'available' : 'unavailable',
+    scanimage: scanimageOk ? 'available' : 'unavailable',
+    ghostscript: gsOk ? 'available' : 'unavailable',
+    pdftotext: pdftotextOk ? 'available' : 'unavailable',
+    pdfinfo: pdfinfoOk ? 'available' : 'unavailable',
+    pdftoppm: pdftoppmOk ? 'available' : 'unavailable',
+    imagemagick_identify: identifyOk ? 'available' : 'unavailable',
+    imagemagick_convert: convertOk ? 'available' : 'unavailable',
+    polycr: polycrOk ? `available (${POLYCR_URL})` : 'unavailable',
+    polycr_url: POLYCR_URL,
+    default_lang: OCR_AXI_LANG,
+    default_scanner: DEFAULT_SCANNER_KEY,
+    vision_ocr_url: VISION_OCR_URL,
+    vision_ocr_model: VISION_OCR_MODEL,
+    vision_key_configured: resolveVisionKey() ? 'true' : 'false',
+  });
+}
+
+function showHelp() {
+  process.stdout.write(`ocr-axi — OCR and scanning AXI CLI
+
+Usage:
+  ocr-axi image <path> [--lang eng] [--output text|hocr|pdf]
+      OCR an image using OpenRouter vision OCR (if configured) with
+      automatic fallback to local Tesseract.
+
+  ocr-axi pdf <path> [--output-dir dir] [--lang eng]
+      Add a searchable text layer to a PDF using ocrmypdf.
+
+  ocr-axi pdf-text <path>
+      Extract text from a PDF's text layer or OCR page 1 if no text layer.
+
+  ocr-axi pdf-pages <path>
+      Count pages in a PDF via pdfinfo.
+
+  ocr-axi scan [--device key] [--format jpeg|pdf|png] [--dpi 300] [--output path]
+      Scan a single page via scanimage (flatbed).
+
+  ocr-axi polycr <image-or-pdf-path> [--mode document|photo] [--lang eng]
+      Advanced OCR via the Polycr multi-engine service (if available).
+
+  ocr-axi status
+      Check which tools are available.
+
+  ocr-axi help
+      Show this help.
+
+Environment:
+  POLYCR_URL         Polycr service URL (default: http://polycr:8000)
+  SCANNER_DEVICE     scanimage device string for HP (default: escl:http://192.168.1.183:8080)
+  CANON_ESCL_BASE    Canon eSCL base URL (default: http://192.168.1.141)
+  OCR_AXI_LANG       Default OCR language (default: eng)
+  VISION_OCR_URL     Vision OCR endpoint (default: http://polycr:8000)
+  VISION_OCR_MODEL   Vision model name (default: qwen/qwen3-vl-32b-instruct)
+  VISION_OCR_KEY     Bearer token for vision endpoint (falls back to OPENROUTER_API_KEY)
+  OPENROUTER_API_KEY API key for OpenRouter vision OCR
+`);
+}
+
+// ─── CLI dispatch ────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.length === 0 || args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+    showHelp();
+    process.exit(0);
+  }
+
+  // Parse named options (--key value)
+  const opts = {};
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--')) {
+      const key = args[i].slice(2).replace(/-/g, '_');
+      const val = args[i + 1] && !args[i + 1].startsWith('--') ? args[++i] : 'true';
+      opts[key] = val;
+    } else {
+      positional.push(args[i]);
+    }
+  }
+
+  const cmd = positional[0];
+  const cmdArgs = positional.slice(1);
+
+  try {
+    switch (cmd) {
+      case 'image':
+        await cmdImage(cmdArgs[0], opts);
+        break;
+      case 'pdf':
+        await cmdPdf(cmdArgs[0], opts);
+        break;
+      case 'pdf-text':
+        await cmdPdfText(cmdArgs[0]);
+        break;
+      case 'pdf-pages':
+        await cmdPdfPages(cmdArgs[0]);
+        break;
+      case 'scan':
+        await cmdScan(opts);
+        break;
+      case 'polycr':
+        await cmdPolycr(cmdArgs[0], opts);
+        break;
+      case 'status':
+        await cmdStatus();
+        break;
+      default:
+        process.stderr.write(`ocr-axi: unknown command "${cmd}"\nRun 'ocr-axi help' for usage.\n`);
+        process.exit(1);
+    }
+  } catch (err) {
+    toon({ ok: 'false', error: err.message });
+    process.exit(1);
+  }
+}
+
+main();

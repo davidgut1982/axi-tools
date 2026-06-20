@@ -1,0 +1,18 @@
+{
+  "name": "tavily-axi",
+  "version": "1.0.0",
+  "description": "Real-time web search via Tavily API",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "TAVILY_AXI_API_KEY": "",
+    "TAVILY_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "search", "desc": "Real-time web search", "args": ["<query>", "--limit", "--depth", "--include-answer"]},
+    {"name": "extract", "desc": "Extract content from a URL", "args": ["<url>", "--limit"]},
+    {"name": "status", "desc": "API connectivity check", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-tavily-axi.js"
+}

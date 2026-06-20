@@ -1,0 +1,20 @@
+{
+  "name": "nextcloud-axi",
+  "version": "1.0.0",
+  "description": "Nextcloud file operations, shares, and user info via WebDAV + OCS API",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "NEXTCLOUD_AXI_URL": "",
+    "NEXTCLOUD_AXI_USER": "",
+    "NEXTCLOUD_AXI_PASSWORD": ""
+  },
+  "commands": [
+    {"name": "files", "desc": "File operations", "args": ["list|upload|download|delete|mkdir|move|share"]},
+    {"name": "shares", "desc": "Share operations", "args": ["list"]},
+    {"name": "user", "desc": "User operations", "args": ["info"]},
+    {"name": "status", "desc": "Verify connectivity", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-nextcloud-axi.js"
+}

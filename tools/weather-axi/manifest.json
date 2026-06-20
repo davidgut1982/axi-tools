@@ -1,0 +1,20 @@
+{
+  "name": "weather-axi",
+  "version": "1.0.0",
+  "description": "Weather forecasts, alerts, air quality (OpenMeteo + NOAA, free)",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "WEATHER_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "forecast", "desc": "7-day weather forecast", "args": ["<location>", "--days"]},
+    {"name": "current", "desc": "Current weather conditions", "args": ["<location>"]},
+    {"name": "alerts", "desc": "Active NOAA weather alerts for a US state", "args": ["<state>"]},
+    {"name": "air-quality", "desc": "Current air quality", "args": ["<lat>", "<lon>"]},
+    {"name": "locate", "desc": "Geocode a city to lat/lon", "args": ["<city>"]},
+    {"name": "status", "desc": "API connectivity check", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-weather-axi.js"
+}

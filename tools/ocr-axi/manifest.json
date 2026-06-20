@@ -1,0 +1,23 @@
+{
+  "name": "ocr-axi",
+  "version": "1.0.0",
+  "description": "OCR and document scanning (Tesseract, OpenRouter vision, ocrmypdf, scanimage, Polycr)",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "OCR_AXI_URL": "",
+    "POLYCR_HOST": "",
+    "SCANNER_DEVICE": ""
+  },
+  "commands": [
+    {"name": "image", "desc": "OCR an image", "args": ["<path>", "--lang", "--output"]},
+    {"name": "pdf", "desc": "Add searchable text layer to PDF", "args": ["<path>", "--output-dir", "--lang"]},
+    {"name": "pdf-text", "desc": "Extract text from PDF", "args": ["<path>"]},
+    {"name": "pdf-pages", "desc": "Count PDF pages", "args": ["<path>"]},
+    {"name": "scan", "desc": "Scan a page via scanimage", "args": ["--device", "--format", "--dpi", "--output"]},
+    {"name": "polycr", "desc": "Advanced OCR via Polycr service", "args": ["<path>", "--mode", "--lang"]},
+    {"name": "status", "desc": "Check available tools", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-ocr-axi.js"
+}

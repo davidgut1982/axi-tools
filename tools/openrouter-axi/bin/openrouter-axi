@@ -1,0 +1,465 @@
+#!/usr/bin/env node
+// openrouter-axi — OpenRouter admin API via direct HTTPS
+// Zero dependencies. TOON output. Agent-friendly.
+// Docs: https://openrouter.ai/docs/api-reference/overview
+
+const https = require('https');
+
+// ── Configuration ───────────────────────────────────
+
+const API_KEY = process.env.OPENROUTER_AXI_API_KEY || process.env.OPENROUTER_API_KEY || '';
+const API_HOST = 'openrouter.ai';
+const TIMEOUT_MS = 30000;
+
+// ── HTTPS request helper ─────────────────────────────
+
+function httpsRequest(method, path) {
+  return new Promise(function(resolve, reject) {
+    var options = {
+      hostname: API_HOST,
+      port: 443,
+      path: path,
+      method: method,
+      headers: {
+        'Authorization': 'Bearer ' + API_KEY,
+        'Content-Type': 'application/json'
+      },
+      timeout: TIMEOUT_MS
+    };
+
+    var req = https.request(options, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var raw = Buffer.concat(chunks).toString('utf8');
+        var data;
+        try { data = JSON.parse(raw); } catch (_) { data = raw; }
+        if (res.statusCode >= 400) {
+          var msg = typeof data === 'object' && data.error ? (data.error.message || data.error) : raw.slice(0, 300);
+          reject(new Error('HTTP ' + res.statusCode + ': ' + msg));
+          return;
+        }
+        resolve(data);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.on('timeout', function() {
+      req.destroy();
+      reject(new Error('request timeout after ' + (TIMEOUT_MS / 1000) + 's'));
+    });
+    req.end();
+  });
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') return JSON.stringify(v);
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function okOut(dataObj) {
+  console.log(toon({ ok: true, data: dataObj }));
+}
+
+// ── CLI helpers ─────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+function requireArg(args, idx, name) {
+  if (idx >= args.length || args[idx].startsWith('-')) {
+    die('missing ' + name);
+  }
+  return args[idx];
+}
+
+// ── Formatters ─────────────────────────────────────
+
+function formatModel(m) {
+  var parts = [m.id, (m.name || m.id)];
+  if (m.context_length) parts.push(m.context_length.toString());
+  if (m.pricing) {
+    var p = m.pricing;
+    var priceParts = [];
+    if (p.prompt != null) priceParts.push('$' + p.prompt);
+    if (p.completion != null) priceParts.push('$' + p.completion);
+    if (priceParts.length) parts.push(priceParts.join('/'));
+  }
+  return parts.join(' | ');
+}
+
+function formatKeys(k) {
+  var parts = [k.label || k.name || '?', (k.key || '').slice(0, 20) + '...'];
+  if (k.created) parts.push(k.created);
+  if (k.limit != null) parts.push('limit:' + k.limit);
+  return parts.join(' | ');
+}
+
+function tsToStr(ts) {
+  if (!ts) return '?';
+  var d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+function formatActivity(a) {
+  var parts = [];
+  if (a.created_at) parts.push(a.created_at);
+  else if (a.timestamp) parts.push(tsToStr(a.timestamp));
+  else parts.push('?');
+
+  if (a.model || a.model_id) parts.push(a.model || a.model_id);
+
+  if (a.total_tokens != null) parts.push(a.total_tokens + 't');
+  else if (a.usage != null) {
+    var u = a.usage;
+    var tok = u.total_tokens || u.total || '?';
+    parts.push(tok + 't');
+  }
+
+  if (a.tag || a.tags) parts.push(a.tag || (Array.isArray(a.tags) ? a.tags.join(',') : a.tags));
+  return parts.join(' | ');
+}
+
+function formatParam(info) {
+  // info is { type, default, minimum, maximum, values, ... }
+  var parts = [];
+  if (info.type) parts.push(info.type);
+  if (info.default !== undefined) parts.push('default=' + info.default);
+  if (info.minimum !== undefined) parts.push('min=' + info.minimum);
+  if (info.maximum !== undefined) parts.push('max=' + info.maximum);
+  if (info.values && Array.isArray(info.values)) parts.push('[' + info.values.join(',') + ']');
+  return parts.join(' ');
+}
+
+// ── Commands ────────────────────────────────────────
+
+async function cmdCredits() {
+  var result = await httpsRequest('GET', '/api/v1/credits');
+  var data = result.data || result;
+  console.log('ok: true');
+  console.log('credits{total,used,remaining}:');
+  var total = data.total_credits != null ? data.total_credits : data.total;
+  var used = data.total_usage != null ? data.total_usage : (data.used || 0);
+  console.log('  total: ' + (total != null ? total : '?'));
+  console.log('  used: ' + used);
+  if (total != null) console.log('  remaining: ' + (total - used));
+  var label = data.label || '';
+  if (label) console.log('  label: ' + label);
+}
+
+async function cmdModels(args) {
+  var query = flagVal(args, '--search') || flagVal(args, '-q') || '';
+  var limit = parseInt(flagVal(args, '--limit') || '50', 10);
+  var path = '/api/v1/models';
+  if (query) path += '?q=' + encodeURIComponent(query);
+  if (limit) path += (query ? '&' : '?') + 'limit=' + limit;
+
+  var result = await httpsRequest('GET', path);
+  var models = Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
+
+  console.log('ok: true');
+  if (query) console.log('models[' + models.length + ']{id,name,context_length,pricing} q="' + query + '":');
+  else console.log('models[' + models.length + ']{id,name,context_length,pricing}:');
+
+  for (var i = 0; i < models.length; i++) {
+    console.log('  ' + formatModel(models[i]));
+  }
+
+  if (models.length > 0) {
+    console.log('help[' + Math.min(3, models.length) + ']:');
+    console.log('  openrouter-axi models --search "gpt" --limit 20');
+    console.log('  openrouter-axi model ' + models[0].id);
+    if (models.length > 1) console.log('  openrouter-axi model ' + models[1].id);
+  }
+}
+
+async function cmdModel(args) {
+  var modelId = requireArg(args, 1, 'model-id');
+  var result = await httpsRequest('GET', '/api/v1/models/' + encodeURIComponent(modelId));
+  var data = result.data || result;
+
+  console.log('ok: true');
+  console.log('model:');
+  console.log('  id: ' + (data.id || modelId));
+  console.log('  name: ' + (data.name || '?'));
+  if (data.description) {
+    var desc = data.description.slice(0, 200).replace(/\n/g, ' ');
+    console.log('  description: ' + desc);
+  }
+  console.log('  context_length: ' + (data.context_length || '?'));
+  if (data.pricing) {
+    console.log('  pricing:');
+    if (data.pricing.prompt != null) console.log('    prompt: $' + data.pricing.prompt + '/1M tokens');
+    if (data.pricing.completion != null) console.log('    completion: $' + data.pricing.completion + '/1M tokens');
+    if (data.pricing.image != null) console.log('    image: $' + data.pricing.image + '/image');
+  }
+  if (data.top_provider) console.log('  top_provider: ' + (typeof data.top_provider === 'object' ? data.top_provider.name || data.top_provider : data.top_provider));
+  if (data.architecture && data.architecture.modality) {
+    console.log('  modality: ' + data.architecture.modality);
+  }
+
+  console.log('help[1]:');
+  console.log('  openrouter-axi params ' + modelId);
+}
+
+async function cmdKeys() {
+  var result = await httpsRequest('GET', '/api/v1/keys');
+  var keys = Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
+
+  console.log('ok: true');
+  console.log('keys[' + keys.length + ']{label,key,created}:');
+
+  for (var i = 0; i < keys.length; i++) {
+    console.log('  ' + formatKeys(keys[i]));
+  }
+
+  if (keys.length > 0) {
+    console.log('help[1]:');
+    console.log('  Manage keys at https://openrouter.ai/keys');
+  }
+}
+
+async function cmdActivity(args) {
+  var limit = parseInt(flagVal(args, '--limit') || '20', 10);
+  var path = '/api/v1/activity';
+  path += '?limit=' + limit;
+
+  var result = await httpsRequest('GET', path);
+  var activity = Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
+
+  console.log('ok: true');
+  console.log('activity[' + activity.length + ']{timestamp,model,tokens,tag}:');
+
+  for (var i = 0; i < activity.length; i++) {
+    console.log('  ' + formatActivity(activity[i]));
+  }
+
+  if (activity.length > 0) {
+    console.log('help[1]:');
+    console.log('  openrouter-axi activity --limit 50');
+  }
+}
+
+async function cmdParams(args) {
+  var modelId = requireArg(args, 1, 'model-id');
+  var path = '/api/v1/parameters/' + encodeURIComponent(modelId);
+  var result = await httpsRequest('GET', path);
+  var data = result.data || result;
+
+  console.log('ok: true');
+  console.log('parameters:');
+
+  if (data.supported_parameters) {
+    var params = data.supported_parameters;
+    if (Array.isArray(params)) {
+      for (var i = 0; i < params.length; i++) {
+        var p = params[i];
+        var name = typeof p === 'string' ? p : p.name || p.param || '?';
+        var info = typeof p === 'string' ? '' : ' ' + formatParam(p);
+        console.log('  ' + name + ':' + info);
+      }
+    } else if (typeof params === 'object') {
+      var keys = Object.keys(params);
+      for (var k = 0; k < keys.length; k++) {
+        var pk = keys[k];
+        var pv = params[pk];
+        var inf = typeof pv === 'string' ? ' (' + pv + ')' : '';
+        if (typeof pv === 'object' && pv !== null) {
+          inf = ' ' + formatParam(pv);
+        }
+        console.log('  ' + pk + ':' + inf);
+      }
+    }
+  } else {
+    // Show raw structure
+    console.log(toon(data));
+  }
+
+  console.log('help[1]:');
+  console.log('  https://openrouter.ai/docs/api-reference/parameters');
+}
+
+async function cmdStatus() {
+  if (!API_KEY) {
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: no_key');
+    console.log('  error: OPENROUTER_AXI_API_KEY not set');
+    console.log('  key_configured: no');
+    console.log('  api: https://openrouter.ai/api/v1');
+    process.exit(0);
+  }
+
+  var start = Date.now();
+  try {
+    var result = await httpsRequest('GET', '/api/v1/credits');
+    var elapsed = Date.now() - start;
+    var data = result.data || result;
+
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: ok');
+    console.log('  latency_ms: ' + elapsed);
+    console.log('  key_configured: yes');
+    console.log('  api: https://openrouter.ai/api/v1');
+
+    var total = data.total_credits != null ? data.total_credits : (data.total || '?');
+    var used = data.total_usage != null ? data.total_usage : (data.used || '?');
+    console.log('  credits:');
+    console.log('    total: ' + total);
+    console.log('    used: ' + used);
+  } catch (e) {
+    var elapsed = Date.now() - start;
+    console.log('ok: true');
+    console.log('data:');
+    console.log('  status: error');
+    console.log('  latency_ms: ' + elapsed);
+    console.log('  error: ' + e.message);
+    console.log('  api: https://openrouter.ai/api/v1');
+    console.log('  key_configured: ' + (API_KEY ? 'yes' : 'no'));
+    process.exit(1);
+  }
+}
+
+function cmdHelp() {
+  console.log('openrouter-axi <command> [options]');
+  console.log('');
+  console.log('Commands:');
+  console.log('  credits                        Get credit balance');
+  console.log('      GET /api/v1/credits');
+  console.log('');
+  console.log('  models [--search q] [--limit N]  List available models');
+  console.log('      GET /api/v1/models?q=&limit=');
+  console.log('');
+  console.log('  model <model-id>               Get model details');
+  console.log('      GET /api/v1/models/:id');
+  console.log('');
+  console.log('  keys                           List API keys');
+  console.log('      GET /api/v1/keys');
+  console.log('');
+  console.log('  activity [--limit N]           Recent generation activity');
+  console.log('      GET /api/v1/activity');
+  console.log('');
+  console.log('  params <model-id>              Get model parameters');
+  console.log('      GET /api/v1/parameters/:model');
+  console.log('');
+  console.log('  status                         Test auth + show key info');
+  console.log('');
+  console.log('  help                           Show this help');
+  console.log('');
+  console.log('Env:');
+  console.log('  OPENROUTER_AXI_API_KEY   OpenRouter API key (required)');
+  console.log('  OPENROUTER_API_KEY       Fallback API key');
+  console.log('');
+  console.log('Get a key: https://openrouter.ai/keys');
+  console.log('Docs: https://openrouter.ai/docs/api-reference/overview');
+}
+
+// ── Main ────────────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
+  cmdHelp();
+  process.exit(0);
+}
+
+// Let individual commands check for API key (status works without it)
+var needsKey = ['credits', 'models', 'model', 'keys', 'activity', 'params'].indexOf(cmd) !== -1;
+if (needsKey && !API_KEY) {
+  die('OPENROUTER_AXI_API_KEY not set. Get a key at https://openrouter.ai/keys');
+}
+
+(async function main() {
+  try {
+    switch (cmd) {
+      case 'credits':
+        await cmdCredits();
+        break;
+      case 'models':
+        await cmdModels(args);
+        break;
+      case 'model':
+        await cmdModel(args);
+        break;
+      case 'keys':
+        await cmdKeys();
+        break;
+      case 'activity':
+        await cmdActivity(args);
+        break;
+      case 'params':
+        await cmdParams(args);
+        break;
+      case 'status':
+        await cmdStatus();
+        break;
+      default:
+        die('unknown command: ' + cmd + ' (use --help to see all commands)');
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();

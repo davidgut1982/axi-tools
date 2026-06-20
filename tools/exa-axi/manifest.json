@@ -1,0 +1,18 @@
+{
+  "name": "exa-axi",
+  "version": "1.0.0",
+  "description": "AI-powered web search via Exa API",
+  "runtime": "node >= 18",
+  "dependencies": [],
+  "env": {
+    "EXA_AXI_API_KEY": "",
+    "EXA_AXI_URL": ""
+  },
+  "commands": [
+    {"name": "search", "desc": "AI-powered web search", "args": ["<query>", "--limit", "--type"]},
+    {"name": "similar", "desc": "Find pages similar to a URL", "args": ["<url>", "--limit"]},
+    {"name": "status", "desc": "API connectivity check", "args": []},
+    {"name": "help", "desc": "Show help", "args": []}
+  ],
+  "plugin": "plugin/axi-exa-axi.js"
+}
