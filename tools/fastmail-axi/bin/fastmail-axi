@@ -9,7 +9,7 @@ const { URL } = require('url');
 
 // ── Configuration ───────────────────────────────────
 
-const FASTMAIL_URL = process.env.FASTMAIL_AXI_URL || 'http://localhost:8001';
+var FASTMAIL_URL = process.env.FASTMAIL_AXI_URL || 'http://localhost:8001/mcp';
 
 http.globalAgent.keepAlive = true;
 
@@ -24,6 +24,7 @@ var PATH = BASE.pathname || '/';
 var _initialized = false;
 var _toolSchemas = null;   // { toolName: { inputSchema, description } }
 var _serverCapabilities = null;
+var _sessionId = null;     // MCP streamable-http session ID
 
 // ── Low-level MCP JSON-RPC call ─────────────────────
 
@@ -50,11 +51,16 @@ function mcpSend(method, params, id) {
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
-        'Content-Length': Buffer.byteLength(payload)
+        'Content-Length': Buffer.byteLength(payload),
+        ...(_sessionId ? { 'Mcp-Session-Id': _sessionId } : {})
       }
     };
 
     var req = transport.request(options, function(res) {
+      // Capture session ID from streamable-http transport
+      if (res.headers['mcp-session-id']) {
+        _sessionId = res.headers['mcp-session-id'];
+      }
       var body = '';
       res.on('data', function(chunk) { body += chunk.toString(); });
       res.on('end', function() {
@@ -134,7 +140,7 @@ async function ensureInitialized() {
   // Step 2: send initialized notification (no id, fire-and-forget)
   try {
     // Notification — no id, no response expected
-    mcpSend('notifications/initialized', {}, null);
+    await mcpSend('notifications/initialized', {}, null);
   } catch (_) { /* ignore */ }
 
   // Step 3: discover tools
@@ -464,8 +470,8 @@ async function cmdCalendar(args) {
   var params = {};
   var from = flagVal(args, '--from');
   var to = flagVal(args, '--to');
-  if (from) params.from = from;
-  if (to) params.to = to;
+  if (from) params.startDate = from;
+  if (to) params.endDate = to;
 
   var result = await mcpCallTool('list_calendar_events', params);
   var events = result.events || result || [];
@@ -482,7 +488,7 @@ async function cmdEvent(args) {
   var eventId = args[1];
   if (!eventId) die('missing event ID');
 
-  var result = await mcpCallTool('get_calendar_event', { event_id: eventId });
+  var result = await mcpCallTool('get_calendar_event', { eventId: eventId });
   var event = result.event || result;
   ok(event);
 }
@@ -514,7 +520,7 @@ async function cmdDeleteEvent(args) {
     if (!confirmed) die('cancelled');
   }
 
-  var result = await mcpCallTool('delete_calendar_event', { event_id: eventId });
+  var result = await mcpCallTool('delete_calendar_event', { eventId: eventId });
   ok(result || { deleted: eventId });
 }
 

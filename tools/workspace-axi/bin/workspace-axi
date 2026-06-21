@@ -10,7 +10,8 @@ const { URL } = require('url');
 
 // ── Configuration ───────────────────────────────────
 
-const WORKSPACE_URL = process.env.WORKSPACE_AXI_URL || 'http://localhost:8000';
+const WORKSPACE_URL = process.env.WORKSPACE_AXI_URL || 'http://localhost:8000/mcp';
+var _mcpSessionId = null;
 
 http.globalAgent.keepAlive = true;
 
@@ -52,13 +53,19 @@ function mcpSend(method, params, id) {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
         'Content-Length': Buffer.byteLength(payload)
-      }
+      },
     };
+    if (_mcpSessionId) { options.headers['mcp-session-id'] = _mcpSessionId; }
 
     var req = transport.request(options, function(res) {
       var body = '';
       res.on('data', function(chunk) { body += chunk.toString(); });
       res.on('end', function() {
+        // Capture MCP session ID from HTTP header (streamable-http)
+        if (res.headers && res.headers['mcp-session-id']) {
+          _mcpSessionId = res.headers['mcp-session-id'];
+        }
+
         if (res.statusCode >= 400) {
           var preview = body.slice(0, 500);
           reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
@@ -1000,7 +1007,7 @@ function cmdHelp() {
   console.log('  call <tool-name> --key val --key2 val2       Call with key=value args');
   console.log('  help                                         Show this help');
   console.log('');
-  console.log('Env: WORKSPACE_AXI_URL (default: http://localhost:8000)');
+  console.log('Env: WORKSPACE_AXI_URL (default: http://localhost:8000/mcp)');
 }
 
 // ── Utility ─────────────────────────────────────────

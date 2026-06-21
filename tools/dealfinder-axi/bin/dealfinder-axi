@@ -1,0 +1,418 @@
+#!/usr/bin/env node
+// dealfinder-axi — Deal finding: search products, compare prices
+// Communicates via MCP JSON-RPC over HTTP.
+// Token-efficient TOON output. Agent-friendly.
+
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
+// ── Configuration ───────────────────────────────────
+
+const DEALFINDER_URL = process.env.DEALFINDER_AXI_URL || 'http://localhost:8012/mcp';
+
+http.globalAgent.keepAlive = true;
+
+var BASE = new URL(DEALFINDER_URL);
+var PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
+var HOSTNAME = BASE.hostname;
+var PORT = parseInt(BASE.port, 10) || (PROTOCOL === 'https' ? 443 : 80);
+var PATH = BASE.pathname || '/';
+
+// ── MCP state ───────────────────────────────────────
+
+var _initialized = false;
+var _toolSchemas = null;   // { toolName: { inputSchema, description } }
+var _serverCapabilities = null;
+
+// ── Low-level MCP JSON-RPC call ─────────────────────
+
+function mcpSend(method, params, id) {
+  var rpc = {
+    jsonrpc: '2.0',
+    method: method,
+    params: params || {}
+  };
+  if (id !== null) {
+    rpc.id = id || Date.now();
+  }
+  var payload = JSON.stringify(rpc);
+
+  return new Promise(function(resolve, reject) {
+    var transport = PROTOCOL === 'https' ? https : http;
+
+    var options = {
+      hostname: HOSTNAME,
+      port: PORT,
+      path: PATH,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    var req = transport.request(options, function(res) {
+      var body = '';
+      res.on('data', function(chunk) { body += chunk.toString(); });
+      res.on('end', function() {
+        if (res.statusCode >= 400) {
+          var preview = body.slice(0, 500);
+          reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
+          return;
+        }
+
+        var jsonData = null;
+        var lines = body.split('\n');
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i];
+          if (line.indexOf('data: ') === 0 || line.indexOf('data:') === 0) {
+            var jsonStr = line.slice(line.indexOf(':') + 1).trim();
+            if (jsonStr) {
+              try {
+                var candidate = JSON.parse(jsonStr);
+                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                  jsonData = candidate;
+                }
+              } catch (_) { /* skip non-JSON data lines */ }
+            }
+          }
+        }
+
+        if (!jsonData) {
+          try {
+            var direct = JSON.parse(body);
+            if (direct && typeof direct === 'object') {
+              jsonData = direct;
+            }
+          } catch (_) { /* body is not pure JSON */ }
+        }
+
+        if (!jsonData) {
+          reject(new Error('No valid JSON-RPC response. Body preview: ' + body.slice(0, 300)));
+          return;
+        }
+
+        if (jsonData.error) {
+          reject(new Error(jsonData.error.message || JSON.stringify(jsonData.error)));
+          return;
+        }
+
+        resolve(jsonData.result);
+      });
+      res.on('error', reject);
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, function() {
+      req.destroy();
+      reject(new Error('request timeout after 30s'));
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+// ── MCP handshake and tool call ─────────────────────
+
+async function ensureInitialized() {
+  if (_initialized) return;
+
+  var initResult = await mcpSend('initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'dealfinder-axi', version: '1.0.0' }
+  }, 1);
+
+  _serverCapabilities = initResult;
+
+  try {
+    mcpSend('notifications/initialized', {}, null);
+  } catch (_) { /* ignore */ }
+
+  var toolsResult = await mcpSend('tools/list', {}, 2);
+
+  _toolSchemas = {};
+  if (toolsResult && Array.isArray(toolsResult.tools)) {
+    for (var i = 0; i < toolsResult.tools.length; i++) {
+      var t = toolsResult.tools[i];
+      _toolSchemas[t.name] = {
+        description: t.description || '',
+        inputSchema: t.inputSchema || {}
+      };
+    }
+  }
+
+  _initialized = true;
+}
+
+async function mcpCallTool(toolName, params) {
+  await ensureInitialized();
+  params = params || {};
+
+  var result = await mcpSend('tools/call', {
+    name: toolName,
+    arguments: params
+  }, Date.now());
+
+  if (result && Array.isArray(result.content)) {
+    var textItem = null;
+    for (var j = 0; j < result.content.length; j++) {
+      if (result.content[j].type === 'text') {
+        textItem = result.content[j];
+        break;
+      }
+    }
+    if (textItem && typeof textItem.text === 'string') {
+      try {
+        result = JSON.parse(textItem.text);
+      } catch (_) {
+        result = textItem.text;
+      }
+    }
+  }
+
+  return result;
+}
+
+// ── TOON formatter ──────────────────────────────────
+
+function toon(obj) {
+  function val(v, indent) {
+    indent = indent || 0;
+    var pad = '';
+    for (var i = 0; i < indent; i++) pad += '  ';
+    if (v === null || v === undefined) return 'null';
+    if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      var special = /[:#!$%&*?|<>;@`\n\r\t"'\[\]{},]|^\s|\s$/;
+      if (special.test(v) || v === '') {
+        return JSON.stringify(v);
+      }
+      return v;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) return '[]';
+      var lines = [];
+      for (var j = 0; j < v.length; j++) {
+        var item = v[j];
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          var inner = val(item, indent + 1);
+          inner = inner.replace(/^\n/, '');
+          lines.push(pad + '  - ' + inner);
+        } else {
+          lines.push(pad + '  - ' + val(item, indent + 1));
+        }
+      }
+      return '[' + v.length + ']\n' + lines.join('\n');
+    }
+    if (typeof v === 'object') {
+      var keys = Object.keys(v);
+      if (keys.length === 0) return '{}';
+      var lines2 = [];
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var vv = val(v[key], indent + 1);
+        if (vv.indexOf('\n') !== -1) {
+          lines2.push(pad + '  ' + key + ':');
+          var innerLines = vv.split('\n');
+          for (var li = 0; li < innerLines.length; li++) {
+            var ln = innerLines[li];
+            if (ln.trim()) lines2.push(pad + '    ' + ln.trimStart());
+          }
+        } else {
+          lines2.push(pad + '  ' + key + ': ' + vv);
+        }
+      }
+      return '\n' + lines2.join('\n');
+    }
+    return String(v);
+  }
+  return val(obj).replace(/^\n/, '').trim();
+}
+
+function die(msg) {
+  console.log(toon({ ok: false, error: msg }));
+  process.exit(1);
+}
+
+function ok(dataObj) {
+  console.log(toon({ ok: true, data: dataObj }));
+}
+
+// ── Helpers ─────────────────────────────────────────
+
+function flagVal(args, flag) {
+  var idx = args.indexOf(flag);
+  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : null;
+}
+
+function hasFlag(args, flag) {
+  return args.indexOf(flag) !== -1;
+}
+
+function requireArg(args, idx, name) {
+  if (idx >= args.length || args[idx].startsWith('-')) {
+    die('missing ' + name);
+  }
+  return args[idx];
+}
+
+// ── Tool name resolution ────────────────────────────
+
+function findTool(patterns) {
+  if (_toolSchemas) {
+    for (var i = 0; i < patterns.length; i++) {
+      if (_toolSchemas[patterns[i]]) return patterns[i];
+    }
+    // Fuzzy: search tool names
+    var names = Object.keys(_toolSchemas);
+    for (var j = 0; j < patterns.length; j++) {
+      for (var k = 0; k < names.length; k++) {
+        if (names[k].indexOf(patterns[j]) !== -1) return names[k];
+      }
+    }
+  }
+  // Fallback: return first pattern as best guess
+  return patterns[0];
+}
+
+// ── Deal formatters ─────────────────────────────────
+
+function formatDealSummary(d) {
+  return [
+    d.id || d.productId || '?',
+    (d.title || d.name || '(no title)'),
+    (d.price != null ? d.price : '?'),
+    (d.currency || '$'),
+    (d.store || d.source || d.merchant || '?')
+  ].join(',');
+}
+
+// ── Commands ────────────────────────────────────────
+
+async function cmdSearch(args) {
+  var query = requireArg(args, 1, 'search query');
+  var params = { query: query };
+  var limit = flagVal(args, '--limit');
+  if (limit) params.limit = parseInt(limit, 10) || 10;
+
+  var toolName = findTool(['search_products', 'search', 'product_search', 'find_deals']);
+  var result = await mcpCallTool(toolName, params);
+  var deals = result.deals || result.products || result.results || result || [];
+  if (!Array.isArray(deals)) deals = [deals];
+
+  console.log('ok: true');
+  var cols = deals.length > 0 ? Object.keys(deals[0]).slice(0, 5).join(',') : 'id,title,price,currency,store';
+  console.log('search[' + deals.length + ']{' + cols + '}:');
+  for (var i = 0; i < deals.length; i++) {
+    console.log('  ' + formatDealSummary(deals[i]));
+  }
+
+  if (deals.length > 0) {
+    console.log('help[' + Math.min(deals.length, 3) + ']:');
+    for (var j = 0; j < Math.min(deals.length, 3); j++) {
+      console.log('  dealfinder-axi get ' + (deals[j].id || deals[j].productId || '?'));
+    }
+  }
+}
+
+async function cmdDeals(args) {
+  var params = {};
+  var limit = flagVal(args, '--limit');
+  if (limit) params.limit = parseInt(limit, 10) || 20;
+
+  var toolName = findTool(['get_deals', 'deals', 'list_deals', 'top_deals', 'search_products']);
+  var result = await mcpCallTool(toolName, params);
+  var deals = result.deals || result.products || result.results || result || [];
+  if (!Array.isArray(deals)) deals = [deals];
+
+  console.log('ok: true');
+  console.log('deals[' + deals.length + ']{id,title,price,currency,store}:');
+  for (var i = 0; i < deals.length; i++) {
+    console.log('  ' + formatDealSummary(deals[i]));
+  }
+
+  if (deals.length > 0) {
+    console.log('help[2]:');
+    console.log('  dealfinder-axi search "<query>"');
+    console.log('  dealfinder-axi get ' + (deals[0].id || deals[0].productId || '?'));
+  }
+}
+
+async function cmdStatus(args) {
+  try {
+    await ensureInitialized();
+    var toolCount = _toolSchemas ? Object.keys(_toolSchemas).length : 0;
+    ok({
+      status: 'ok',
+      tools: toolCount,
+      url: DEALFINDER_URL,
+      protocolVersion: (_serverCapabilities && _serverCapabilities.protocolVersion) || '2024-11-05'
+    });
+  } catch (e) {
+    ok({ status: 'error', error: e.message, url: DEALFINDER_URL });
+    process.exit(1);
+  }
+}
+
+function cmdHelp() {
+  console.log('dealfinder-axi <command> [options]');
+  console.log('');
+  console.log('Commands:');
+  console.log('  search <query> [--limit N]        Search for products and deals');
+  console.log('  deals [--limit N]                 Get current top deals');
+  console.log('  status                            Server health check');
+  console.log('  help                              Show this help');
+  console.log('');
+  console.log('Env: DEALFINDER_AXI_URL (default: http://localhost:8012/mcp)');
+}
+
+// ── CLI routing ─────────────────────────────────────
+
+var args = process.argv.slice(2);
+var cmd = args[0];
+
+if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
+  cmdHelp();
+  process.exit(0);
+}
+
+(async function main() {
+  try {
+    switch (cmd) {
+      case 'search':
+        await cmdSearch(args);
+        break;
+      case 'deals':
+        await cmdDeals(args);
+        break;
+      case 'status':
+        await cmdStatus(args);
+        break;
+      case 'call':
+        var toolName = args[1];
+        if (!toolName) die('missing tool name');
+        var params = {};
+        for (var i = 2; i < args.length; i++) {
+          if (args[i].startsWith('--')) {
+            var key = args[i].slice(2);
+            if (i + 1 < args.length && !args[i + 1].startsWith('--')) {
+              params[key] = args[i + 1];
+              i++;
+            } else {
+              params[key] = true;
+            }
+          }
+        }
+        var result = await mcpCallTool(toolName, params);
+        ok(result);
+        break;
+      default:
+        die('unknown command: ' + cmd + ' (use --help to see all commands)');
+    }
+  } catch (e) {
+    die(e.message || String(e));
+  }
+})();
