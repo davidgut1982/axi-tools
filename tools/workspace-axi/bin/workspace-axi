@@ -13,7 +13,7 @@ const { URL } = require('url');
 const WORKSPACE_URL = process.env.WORKSPACE_AXI_URL || 'http://localhost:8000/mcp';
 var _mcpSessionId = null;
 
-http.globalAgent.keepAlive = true;
+http.globalAgent.keepAlive = false;
 
 var BASE = new URL(WORKSPACE_URL);
 var PROTOCOL = BASE.protocol === 'https:' ? 'https' : 'http';
@@ -40,10 +40,9 @@ function mcpSend(method, params, id) {
     rpc.id = id || Date.now();
   }
   var payload = JSON.stringify(rpc);
+  var transport = PROTOCOL === 'https' ? https : http;
 
   return new Promise(function(resolve, reject) {
-    var transport = PROTOCOL === 'https' ? https : http;
-
     var options = {
       hostname: HOSTNAME,
       port: PORT,
@@ -53,55 +52,58 @@ function mcpSend(method, params, id) {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
         'Content-Length': Buffer.byteLength(payload)
-      },
+      }
     };
     if (_mcpSessionId) { options.headers['mcp-session-id'] = _mcpSessionId; }
 
     var req = transport.request(options, function(res) {
+      // Capture MCP session ID from HTTP header
+      if (res.headers && res.headers['mcp-session-id']) {
+        _mcpSessionId = res.headers['mcp-session-id'];
+      }
+
       var body = '';
       res.on('data', function(chunk) { body += chunk.toString(); });
       res.on('end', function() {
-        // Capture MCP session ID from HTTP header (streamable-http)
-        if (res.headers && res.headers['mcp-session-id']) {
-          _mcpSessionId = res.headers['mcp-session-id'];
-        }
-
         if (res.statusCode >= 400) {
-          var preview = body.slice(0, 500);
-          reject(new Error('HTTP ' + res.statusCode + ': ' + preview));
+          reject(new Error('HTTP ' + res.statusCode + ': ' + body.slice(0, 200)));
           return;
         }
 
-        // Parse SSE stream — find JSON-RPC responses in data: lines
+        // Parse SSE stream — find last data: line containing JSON-RPC
         var jsonData = null;
         var lines = body.split('\n');
         for (var i = 0; i < lines.length; i++) {
-          var line = lines[i];
-          if (line.indexOf('data: ') === 0 || line.indexOf('data:') === 0) {
-            var jsonStr = line.slice(line.indexOf(':') + 1).trim();
+          var trimmed = lines[i].trim();
+          if (trimmed.indexOf('data: ') === 0 || trimmed.indexOf('data:') === 0) {
+            var jsonStr = trimmed.slice(trimmed.indexOf(':') + 1).trim();
             if (jsonStr) {
               try {
                 var candidate = JSON.parse(jsonStr);
-                if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
-                  // Use the last valid JSON-RPC object (sometimes there are progress events)
-                  jsonData = candidate;
+                if (candidate && typeof candidate === 'object') {
+                  jsonData = candidate;  // keep last valid one
                 }
               } catch (_) { /* skip non-JSON data lines */ }
             }
           }
         }
 
-        // If no SSE data found, try parsing body as direct JSON-RPC
+        // Fallback: try parsing body as direct JSON-RPC
         if (!jsonData) {
           try {
-            var direct = JSON.parse(body);
-            if (direct && typeof direct === 'object') {
+            var direct = JSON.parse(body.trim());
+            if (direct && typeof direct === 'object' && direct.jsonrpc) {
               jsonData = direct;
             }
           } catch (_) { /* body is not pure JSON */ }
         }
 
         if (!jsonData) {
+          // For notifications (no id), empty response is OK
+          if (id === null) {
+            resolve(null);
+            return;
+          }
           reject(new Error('No valid JSON-RPC response. Body preview: ' + body.slice(0, 300)));
           return;
         }
@@ -150,8 +152,8 @@ async function ensureInitialized() {
 
   // Step 2: send initialized notification (no id, fire-and-forget)
   try {
-    mcpSend('notifications/initialized', {}, null);
-  } catch (_) { /* ignore */ }
+    await mcpSend('notifications/initialized', {}, null);
+  } catch (_) { /* ignore notification errors */ }
 
   // Step 3: discover tools
   var toolsResult;
